@@ -23,8 +23,8 @@ class MuldDownloadManager {
   // constructor
   explicit MuldDownloadManager(const MuldConfig& config);
   DownloadHandler Download(const MuldRequest& request);
-  // void WaitAll();
-  // void Terminate();
+  void WaitAll();
+  void Terminate();
 
  private:
   std::unique_ptr<ThreadPool> threadpool_;

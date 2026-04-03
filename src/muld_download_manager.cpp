@@ -22,7 +22,8 @@ namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
-#define MAX_CHUNK_SIZE (35 * (1 << 20))  // (20MB) // TODO: fix this later
+constexpr size_t MAX_CHUNK_SIZE = (35 * (1 << 20));
+constexpr int MAX_REDIRECT_ALLOW = 3;
 
 namespace muld {
 
@@ -36,40 +37,57 @@ MuldDownloadManager::MuldDownloadManager(const MuldConfig& config)
 DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   Url parsed_url = ParseUrl(request.url);
 
-  FileInfo info;
-  if (parsed_url.scheme == "https") {
-    // info = HttpsDownloader::FetchFileInfo(parsed_url);
-    throw std::runtime_error("HTTPS downloader not yet implemented!");
-  } else if (parsed_url.scheme == "http") {
-    info = HttpDownloader::FetchFileInfo(parsed_url);
-  } else {
-    throw std::invalid_argument("Unsupported protocol scheme: " +
-                                parsed_url.scheme);
-  }
-
-  if (!info.is_valid) {
-    throw std::runtime_error("Failed to fetch file headers or invalid URL.");
-  }
-
-  int num_connections = info.supports_range ? request.max_connections : 1;
-  int nChunks = 1;
-
-  auto job = std::make_shared<DownloadJob>(
-      parsed_url, info.total_size, info.supports_range, request.destination);
+  // initialize job
+  auto job = std::make_shared<DownloadJob>(parsed_url, request.destination);
   jobs_.push_back(job);
 
-  if (info.supports_range) {
-    nChunks = static_cast<int>((info.total_size + MAX_CHUNK_SIZE - 1) /
-                               MAX_CHUNK_SIZE);
+  // fetch file info (header)
+  FetchResult fetch_res;
+  for (int redirect_count = 0; redirect_count < MAX_REDIRECT_ALLOW;
+       redirect_count++) {
+    if (parsed_url.scheme == "http") {
+      fetch_res = HttpDownloader::FetchFileInfo(parsed_url);
+    } else {
+      job->Fail(ErrorCode::NotSupported,
+                parsed_url.scheme + " is not supported!");
 
-    job->InitChunks(nChunks);
-
-    for (int i = 0; i < request.max_connections; i++) {
-      threadpool_->Enqueue({job.get()});
+      return DownloadHandler(job.get());
     }
 
-  } else {
-    job->InitChunks(nChunks);
+    if (fetch_res.state == FetchResult::State::SUCCESSFUL) {
+      break;
+    } else if (fetch_res.state == FetchResult::State::REDIRECT) {
+      auto& url = std::get<FetchRedirect>(fetch_res.data).new_url;
+      parsed_url = ParseUrl(url);
+
+      
+
+
+    } else {
+      // Failed state
+      auto& err = std::get<FetchError>(fetch_res.data);
+      job->Fail(err.error_code, err.https_status_code, err.message);
+      return DownloadHandler(job.get());  // Return gracefully failed handler
+    }
+  }
+
+  if (fetch_res.state == FetchResult::State::REDIRECT) {
+    job->Fail(ErrorCode::MaxRedirectsExceeded, "Exceeded max redirects");
+    return DownloadHandler(job.get());
+  }
+
+  // create tasks
+  auto& info = std::get<FileInfo>(fetch_res.data);
+
+  int num_connections = info.supports_range ? request.max_connections : 1;
+  int nChunks = info.supports_range
+                    ? static_cast<int>((info.total_size + MAX_CHUNK_SIZE - 1) /
+                                       MAX_CHUNK_SIZE)
+                    : 1;
+
+  job->SetState(DownloadJob::DownloadState::Downloading);
+  job->Init(info.total_size, info.supports_range, nChunks);
+  for (int i = 0; i < num_connections; i++) {
     threadpool_->Enqueue({job.get()});
   }
 

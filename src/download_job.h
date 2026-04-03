@@ -1,5 +1,7 @@
 #pragma once
 
+#include <muld/error.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
@@ -15,24 +17,27 @@ namespace muld {
 
 class DownloadJob {
  public:
-  DownloadJob(const Url& url, size_t file_size, bool ranged,
-              const std::string& output_path)
+  enum class DownloadState {
+    Initialized,
+    Downloading,
+    Completed,
+    Failed,
+    Paused,
+    Canceled
+  };
+
+  DownloadJob(const Url& url, const std::string& output_path)
       : url_(url),
-        ranged_(ranged),
-        fileSize_(file_size),
-        writer_(std::make_unique<Writer>(output_path, file_size)),
+        outputPath_(output_path),
         lastRequestedChunk_(0),
-        nDownloadedChunks_(0){};
+        nDownloadedChunks_(0) {
+    state_ = DownloadState::Initialized;
+  };
 
-  DownloadJob(const DownloadJob&) = delete;
-  DownloadJob& operator=(const DownloadJob&) = delete;
-
-  DownloadJob(DownloadJob&&) = delete;
-  DownloadJob& operator=(DownloadJob&&) = delete;
-
-  ~DownloadJob() {}
-
-  void InitChunks(size_t nChunks) {
+  void Init(size_t file_size, bool ranged, size_t nChunks) {
+    fileSize_ = file_size;
+    ranged_ = ranged;
+    writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
     nChunks_ = nChunks;
     chunksInfo_.resize(nChunks);
     chunkSize_ = static_cast<size_t>((fileSize_ + nChunks - 1) / nChunks);
@@ -48,6 +53,15 @@ class DownloadJob {
       chunk.endRange_ = chunk.startRange_ + chunk_size - 1;
     }
   }
+
+  DownloadJob(const DownloadJob&) = delete;
+
+  DownloadJob& operator=(const DownloadJob&) = delete;
+
+  DownloadJob(DownloadJob&&) = delete;
+  DownloadJob& operator=(DownloadJob&&) = delete;
+
+  ~DownloadJob() {}
 
   const Url& GetUrl() const { return url_; }
 
@@ -73,7 +87,7 @@ class DownloadJob {
 
   const size_t GetNumChunks() const { return nChunks_; }
 
-  int GetError() const { return error_; }
+  const MuldError& GetError() const { return error_; }
 
   void NotifyChunkReceived(int index, size_t bytes) {
     auto& chunk = chunksInfo_.at(index);
@@ -81,17 +95,55 @@ class DownloadJob {
     if (chunk.IsFinished()) {
       if (nDownloadedChunks_.fetch_add(1, std::memory_order_acq_rel) ==
           nChunks_ - 1) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        cv_.notify_all();
+        std::lock_guard<std::mutex> lock(wait_mtx_);
+        state_ = DownloadState::Completed;
+        wait_cv_.notify_all();
       }
     }
   }
 
-  bool IsFinished() { return nDownloadedChunks_.load() == nChunks_; }
+  bool IsFinished() {
+    return nDownloadedChunks_.load() == nChunks_ ||
+           state_.load() == DownloadState::Canceled ||
+           state_.load() == DownloadState::Paused ||
+           state_.load() == DownloadState::Completed ||
+           state_.load() == DownloadState::Failed;
+  }
 
   void WaitUntilFinished() {
-    std::unique_lock<std::mutex> lock(mtx_);
-    cv_.wait(lock, [this]() { return IsFinished(); });
+    std::unique_lock<std::mutex> lock(wait_mtx_);
+    wait_cv_.wait(lock, [this]() { return IsFinished(); });
+  }
+
+  void SetState(DownloadState state) { state_ = state; }
+  DownloadState GetState() { return state_.load(); }
+
+  // internal fails
+  void Fail(ErrorCode code, const std::string& detail) {
+    std::lock_guard<std::mutex> erro_lock(error_mtx_);
+    if (state_ == DownloadState::Failed) return;
+
+    state_ = DownloadState::Failed;
+    error_.code = code;
+    error_.detail = detail;
+    error_.http_status = 0;
+
+    std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+    wait_cv_.notify_all();
+  }
+
+  // network fails
+  void Fail(ErrorCode code, int http_status, const std::string& detail) {
+    std::lock_guard<std::mutex> erro_lock(error_mtx_);
+    if (state_ == DownloadState::Failed) return;
+
+    state_ = DownloadState::Failed;
+    error_.code = code;
+    error_.detail = detail;
+    error_.http_status = http_status;
+
+    std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+    wait_cv_.notify_all();
   }
 
  private:
@@ -99,6 +151,7 @@ class DownloadJob {
   bool ranged_;
   size_t fileSize_;
 
+  std::string outputPath_;
   std::unique_ptr<Writer> writer_;
 
   size_t nChunks_;
@@ -107,10 +160,11 @@ class DownloadJob {
   std::vector<ChunkInfo> chunksInfo_;
   size_t chunkSize_;
 
-  int error_ = 0;
+  std::atomic<DownloadState> state_ = DownloadState::Initialized;
+  MuldError error_;
 
-  std::mutex mtx_;
-  std::condition_variable cv_;
+  std::mutex wait_mtx_, error_mtx_;
+  std::condition_variable wait_cv_;
 };
 
 }  // namespace muld

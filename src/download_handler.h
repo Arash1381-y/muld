@@ -60,6 +60,8 @@ class DownloadHandler {
 
   bool IsFinished() const { return job_->IsFinished(); }
 
+  const MuldError& GetError() const { return job_->GetError(); }
+
   void Wait() const { job_->WaitUntilFinished(); }
 
  private:
