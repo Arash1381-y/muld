@@ -87,7 +87,7 @@ class DownloadJob {
   Writer& GetWriter() { return *writer_; }
   const Writer& GetWriter() const { return *writer_; }
 
-  const size_t GetNumChunks() const { return nChunks_; }
+  size_t GetNumChunks() const { return nChunks_; }
 
   const MuldError& GetError() const { return error_; }
 

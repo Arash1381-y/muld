@@ -13,6 +13,7 @@ namespace muld {
 class Writer {
  public:
   explicit Writer(const std::string& file_path, size_t total_size) {
+    // TODO: writer should be throw free!
     fd_ = open(file_path.c_str(), O_WRONLY | O_CREAT, 0644);
     if (fd_ == -1) {
       throw std::system_error(errno, std::generic_category(),
@@ -20,7 +21,10 @@ class Writer {
     }
 
     if (total_size > 0) {
-      ftruncate(fd_, total_size);
+      if (ftruncate(fd_, total_size) == -1) {
+        throw std::system_error(errno, std::generic_category(),
+                                "Failed to open file");
+      }
     }
   }
 

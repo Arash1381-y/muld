@@ -129,7 +129,9 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
         current_offset += static_cast<size_t>(bw);
       }
 
-      // check if job has critical error (e.g. paused/cancelled)
+      // TODO: we have a race here [pass the downloading check but after that
+      // the states changes hence this line notify chunk receive of a stoped
+      // task]
       job->NotifyChunkReceived(chunk.index, bytes_read);
     }
 
@@ -253,6 +255,7 @@ void DownloadWorkerImpl(const Task& task,
       std::size_t current_offset = chunk.startRange_;
       bool chunk_finished = false;
 
+      // TODO: seems we do not give up on a request. is this the correct way?
       // Keep downloading until this chunk is perfectly finished
       while (!chunk_finished) {
         if (!is_connected) {
@@ -297,7 +300,7 @@ void DownloadWorkerImpl(const Task& task,
       }
     }
 
-    // Final clean up
+    // Task final clean up
     if (is_connected && stream) {
       beast::error_code ec;
       if constexpr (std::is_same_v<T, beast::ssl_stream<beast::tcp_stream>>) {
@@ -327,32 +330,46 @@ FetchResult FetchFileInfo(const Url& url) {
   tcp::resolver resolver(ioc);
   std::string port =
       url.port.empty() ? (url.scheme == "https" ? "443" : "80") : url.port;
-  auto const dns_result = resolver.resolve(url.host, port);
-  if (url.scheme == "http") {
-    beast::tcp_stream stream(ioc);
-    stream.connect(dns_result);
-    return FetchFileInfoImpl(stream, url);
-  } else if (url.scheme == "https") {
-    net::ssl::context ctx(net::ssl::context::tlsv12_client);
-    ctx.set_default_verify_paths();
-    ctx.set_verify_mode(net::ssl::verify_peer);
 
-    beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
-    beast::get_lowest_layer(stream).connect(dns_result);
+  try {
+    auto const dns_result = resolver.resolve(url.host, port);
+    if (url.scheme == "http") {
+      beast::tcp_stream stream(ioc);
+      stream.connect(dns_result);
+      return FetchFileInfoImpl(stream, url);
+    } else if (url.scheme == "https") {
+      net::ssl::context ctx(net::ssl::context::tlsv12_client);
+      ctx.set_default_verify_paths();
+      ctx.set_verify_mode(net::ssl::verify_peer);
 
-    if (!SSL_set_tlsext_host_name(stream.native_handle(), url.host.c_str())) {
-      // valid job->fail later
+      beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
+      beast::get_lowest_layer(stream).connect(dns_result);
+
+      if (!SSL_set_tlsext_host_name(stream.native_handle(), url.host.c_str())) {
+        // TODO: valid job->fail later
+      }
+
+      stream.handshake(net::ssl::stream_base::client);
+      return FetchFileInfoImpl(stream, url);
+    } else {
+      FetchResult err;
+      err.state = FetchResult::State::FAILED;
+      err.data = FetchError{
+          ErrorCode::NotSupported, 0,
+          std::string("scheme " + url.scheme + " is not supported!")};
+      return err;
     }
 
-    stream.handshake(net::ssl::stream_base::client);
-    return FetchFileInfoImpl(stream, url);
-  } else {
-    FetchResult err;
-    err.state = FetchResult::State::FAILED;
-    err.data =
-        FetchError{ErrorCode::NotSupported, 0,
-                   std::string("scheme " + url.scheme + " is not supported!")};
-    return err;
+  } catch (beast::system_error const& e) {
+    FetchResult result;
+    result.state = FetchResult::State::FAILED;
+    result.data = FetchError(ErrorCode::NETWORK_ERR, 0, e.what());
+    return result;
+  } catch (std::exception const& e) {
+    FetchResult result;
+    result.state = FetchResult::State::FAILED;
+    result.data = FetchError(ErrorCode::SYSTEM_ERR, 0, e.what());
+    return result;
   }
 }
 

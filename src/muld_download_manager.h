@@ -29,9 +29,9 @@ class MuldDownloadManager {
   void Terminate();
 
  private:
+  LogCallback logger_;
   std::unique_ptr<ThreadPool> threadpool_;
   std::vector<std::shared_ptr<DownloadJob>> jobs_;
-  LogCallback logger_;
 };
 
 }  // namespace muld
