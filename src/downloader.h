@@ -1,15 +1,16 @@
 #pragma once
+
 #include "file_info.h"
-#include "url.h"
 #include "task.h"
+#include "url.h"
 
 namespace muld {
-namespace HttpDownloader {
+namespace NetDownloader {
 
 // Fetches headers using plain HTTP
 FetchResult FetchFileInfo(const Url& url);
 
 void DownloadWorker(const Task& task);
 
-}  // namespace HttpDownloader
+}  // namespace NetDownloader
 }  // namespace muld

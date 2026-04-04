@@ -9,7 +9,8 @@
 namespace muld {
 
 struct MuldConfig {
-  int max_threads;  // maximum threads in thread pool
+  int max_threads = 8;  // maximum threads in thread pool
+  LogCallback logger = nullptr;
 };
 
 struct MuldRequest {
@@ -22,6 +23,7 @@ class MuldDownloadManager {
  public:
   // constructor
   explicit MuldDownloadManager(const MuldConfig& config);
+  ~MuldDownloadManager();
   DownloadHandler Download(const MuldRequest& request);
   void WaitAll();
   void Terminate();
@@ -29,6 +31,7 @@ class MuldDownloadManager {
  private:
   std::unique_ptr<ThreadPool> threadpool_;
   std::vector<std::shared_ptr<DownloadJob>> jobs_;
+  LogCallback logger_;
 };
 
 }  // namespace muld

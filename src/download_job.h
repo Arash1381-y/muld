@@ -1,7 +1,5 @@
 #pragma once
 
-#include <muld/error.h>
-
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
@@ -10,6 +8,7 @@
 #include <vector>
 
 #include "chunk_info.h"
+#include "error.h"
 #include "url.h"
 #include "writer.h"
 
@@ -62,6 +61,9 @@ class DownloadJob {
   DownloadJob& operator=(DownloadJob&&) = delete;
 
   ~DownloadJob() {}
+
+  // used for redirection
+  void SetUrl(const Url& url) { url_ = url; }
 
   const Url& GetUrl() const { return url_; }
 

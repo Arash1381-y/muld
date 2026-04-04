@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(beast_client)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Default to Release if not specified
@@ -20,24 +20,25 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_library(muld
-    src/chunk_info.h
-    src/download_handler.h
-    src/download_job.h
-    src/file_info.h
-    src/http_downloader.h
-    src/muld_download_manager.h
-    src/task.h
-    src/threadpool.h
-    src/url.h
-    src/writer.h
-    src/http_downloader.cpp
-    src/muld_cli.cpp
-    src/muld_download_manager.cpp
-    src/url.cpp
+		src/chunk_info.h
+		src/download_handler.h
+		src/download_job.h
+		src/downloader.h
+		src/error.h
+		src/file_info.h
+		src/logger.h
+		src/muld_download_manager.h
+		src/task.h
+		src/threadpool.h
+		src/url.h
+		src/writer.h
+		src/download_handler.cpp
+		src/downloader.cpp
+		src/muld_download_manager.cpp
+		src/url.cpp
 )
 
 target_include_directories(muld PUBLIC src)
-target_include_directories(muld PUBLIC include)
 
 target_link_libraries(muld
     PRIVATE
@@ -50,6 +51,7 @@ target_link_libraries(muld
 add_executable(muld_cli
     src/muld_cli.cpp
 )
+target_include_directories(muld_cli PUBLIC include)
 
 target_link_libraries(muld_cli 
     PRIVATE

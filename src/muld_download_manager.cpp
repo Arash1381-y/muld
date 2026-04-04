@@ -13,7 +13,7 @@
 #include <optional>
 #include <string>
 
-#include "http_downloader.h"
+#include "downloader.h"
 #include "url.h"
 
 namespace beast = boost::beast;
@@ -22,17 +22,19 @@ namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
-constexpr size_t MAX_CHUNK_SIZE = (35 * (1 << 20));
 constexpr int MAX_REDIRECT_ALLOW = 3;
+constexpr size_t MIN_CHUNK_SIZE = 1 * 1024 * 1024;   // 1 MB
+constexpr size_t MAX_CHUNK_SIZE = 10 * 1024 * 1024;  // 10 MB
 
 namespace muld {
 
+MuldDownloadManager::~MuldDownloadManager() = default;
+
 MuldDownloadManager::MuldDownloadManager(const MuldConfig& config)
-    : threadpool_(std::make_unique<ThreadPool>(
-          config.max_threads, [](const Task& task) {
-            // TODO: will add this later
-            HttpDownloader::DownloadWorker(task);
-          })) {}
+    : logger_(config.logger),
+      threadpool_(std::make_unique<ThreadPool>(
+          config.max_threads,
+          [](const Task& task) { NetDownloader::DownloadWorker(task); })) {}
 
 DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   Url parsed_url = ParseUrl(request.url);
@@ -41,13 +43,24 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   auto job = std::make_shared<DownloadJob>(parsed_url, request.destination);
   jobs_.push_back(job);
 
-  // fetch file info (header)
   FetchResult fetch_res;
   for (int redirect_count = 0; redirect_count < MAX_REDIRECT_ALLOW;
        redirect_count++) {
-    if (parsed_url.scheme == "http") {
-      fetch_res = HttpDownloader::FetchFileInfo(parsed_url);
+    if (logger_) {
+      std::string url_str =
+          (redirect_count == 0)
+              ? request.url
+              : parsed_url.scheme + "://" + parsed_url.host + parsed_url.path;
+      logger_(LogLevel::Info,
+              "Resolving and connecting to " + parsed_url.host + "...");
+    }
+
+    if (parsed_url.scheme == "http" || parsed_url.scheme == "https") {
+      fetch_res = NetDownloader::FetchFileInfo(parsed_url);
     } else {
+      if (logger_) {
+        logger_(LogLevel::Error, parsed_url.scheme + " is not supported!");
+      }
       job->Fail(ErrorCode::NotSupported,
                 parsed_url.scheme + " is not supported!");
 
@@ -55,23 +68,37 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
     }
 
     if (fetch_res.state == FetchResult::State::SUCCESSFUL) {
+      if (logger_) {
+        logger_(LogLevel::Info,
+                "HTTP request sent, awaiting response... 200/206 OK");
+      }
       break;
     } else if (fetch_res.state == FetchResult::State::REDIRECT) {
       auto& url = std::get<FetchRedirect>(fetch_res.data).new_url;
+      if (logger_) {
+        logger_(
+            LogLevel::Info,
+            "HTTP request sent, awaiting response... 302 Moved Temporarily");
+        logger_(LogLevel::Info, "Location: " + url + " [following]");
+      }
       parsed_url = ParseUrl(url);
-
-      
-
-
+      job->SetUrl(parsed_url);
     } else {
       // Failed state
       auto& err = std::get<FetchError>(fetch_res.data);
+      if (logger_) {
+        logger_(LogLevel::Error, "HTTP request failed: " + err.message);
+      }
       job->Fail(err.error_code, err.https_status_code, err.message);
       return DownloadHandler(job.get());  // Return gracefully failed handler
     }
   }
 
   if (fetch_res.state == FetchResult::State::REDIRECT) {
+    if (logger_) {
+      logger_(LogLevel::Error, "Exceeded max redirects (" +
+                                   std::to_string(MAX_REDIRECT_ALLOW) + ")");
+    }
     job->Fail(ErrorCode::MaxRedirectsExceeded, "Exceeded max redirects");
     return DownloadHandler(job.get());
   }
@@ -79,20 +106,58 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   // create tasks
   auto& info = std::get<FileInfo>(fetch_res.data);
 
+  if (logger_) {
+    std::string length_str = "unspecified";
+    if (info.total_size > 0) {
+      // Format like wget: 87274743 (83M)
+      size_t mb = info.total_size / (1024 * 1024);
+      length_str =
+          std::to_string(info.total_size) + " (" + std::to_string(mb) + "M)";
+    }
+
+    std::string type_str =
+        info.supports_range ? "" : " [No Range Support - Single Connection]";
+    logger_(LogLevel::Info, "Length: " + length_str + type_str);
+    logger_(LogLevel::Info,
+            "Saving to: '" + std::string(request.destination) + "'");
+  }
+
   int num_connections = info.supports_range ? request.max_connections : 1;
-  int nChunks = info.supports_range
-                    ? static_cast<int>((info.total_size + MAX_CHUNK_SIZE - 1) /
-                                       MAX_CHUNK_SIZE)
-                    : 1;
+  int nChunks = 1;
+
+  if (info.supports_range && info.total_size > 0) {
+    size_t ideal_chunk_size = info.total_size / (num_connections * 4);
+
+    size_t actual_chunk_size =
+        std::max(MIN_CHUNK_SIZE, std::min(MAX_CHUNK_SIZE, ideal_chunk_size));
+
+    nChunks = static_cast<int>((info.total_size + actual_chunk_size - 1) /
+                               actual_chunk_size);
+  }
 
   job->SetState(DownloadJob::DownloadState::Downloading);
   job->Init(info.total_size, info.supports_range, nChunks);
   for (int i = 0; i < num_connections; i++) {
-    threadpool_->Enqueue({job.get()});
+    threadpool_->Enqueue({.job = job.get(), .logger = this->logger_});
   }
 
   auto handler = DownloadHandler(job.get());
   return handler;
+}
+
+void MuldDownloadManager::WaitAll() {
+  for (const auto& j : jobs_) {
+    j->WaitUntilFinished();
+  }
+}
+
+void MuldDownloadManager::Terminate() {
+  for (const auto& j : jobs_) {
+    // TODO: fix race condition on checking finish and changing state
+    if (!j->IsFinished()) {
+      j->SetState(DownloadJob::DownloadState::Canceled);
+    }
+  }
 }
 
 }  // namespace muld
