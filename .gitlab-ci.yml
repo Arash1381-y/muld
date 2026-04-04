@@ -9,10 +9,7 @@ build-linux:
   stage: build
   image: ubuntu:22.04
   before_script:
-    - |
-      cat <<EOF > /etc/apt/sources.list
-      deb http://mirror.arvancloud.ir/ubuntu/ jammy main universe 
-      EOF
+    - echo "deb http://mirror.arvancloud.ir/ubuntu/ jammy main universe" > /etc/apt/sources.list
     - apt-get update
     - apt-get install -y build-essential cmake libboost-system-dev libssl-dev
 
@@ -39,4 +36,4 @@ release:
     assets:
       links:
         - name: "muld-linux-amd64"
-          url: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/file/build/muld"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/build/muld?job=build-linux"
