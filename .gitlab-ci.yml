@@ -9,6 +9,11 @@ build-linux:
   stage: build
   image: ubuntu:22.04
   before_script:
+   -|
+      cat <<EOF > /etc/apt/sources.list
+      deb http://mirror.arvancloud.ir/ubuntu/ jammy main universe 
+      EOF
+
     - apt-get update
     - apt-get install -y build-essential cmake libboost-system-dev libssl-dev
   script:
