@@ -1,0 +1,37 @@
+stages:
+  - build
+  - release
+
+variables:
+  BUILD_DIR: build
+
+build-linux:
+  stage: build
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update
+    - apt-get install -y build-essential cmake libboost-system-dev libssl-dev
+  script:
+    - cmake -B $BUILD_DIR -DCMAKE_BUILD_TYPE=Release
+    - cmake --build $BUILD_DIR
+  artifacts:
+    paths:
+      - build/muld
+    expire_in: 1 week
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: [build-linux]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Release $CI_COMMIT_TAG"
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "muld-linux-amd64"
+          url: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/file/build/muld"
