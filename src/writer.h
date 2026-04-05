@@ -12,7 +12,8 @@ namespace muld {
 
 class Writer {
  public:
-  explicit Writer(const std::string& file_path, size_t total_size) {
+  explicit Writer(const std::string& file_path, size_t total_size)
+      : filePath_(file_path) {
     // TODO: writer should be throw free!
     fd_ = open(file_path.c_str(), O_WRONLY | O_CREAT, 0644);
     if (fd_ == -1) {
@@ -40,6 +41,8 @@ class Writer {
   ssize_t Write(const char* buffer, std::size_t len, std::size_t offset) {
     return pwrite(fd_, buffer, len, offset);
   }
+
+  std::string filePath_;
 
  private:
   int fd_ = -1;
