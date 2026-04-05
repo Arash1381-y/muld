@@ -1,5 +1,10 @@
 #include "download_job.h"
 
+#include <algorithm>
+#include <chrono>
+#include <utility>
+#include <vector>
+
 #include "chunk_info.h"
 #include "error.h"
 #include "job_image.h"
@@ -8,38 +13,101 @@
 
 namespace muld {
 
-DownloadJob::DownloadJob(const Url& url, const std::string& output_path)
+namespace {
+std::uint64_t GetUnixTimestamp() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+}  // namespace
+
+DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
+                         int max_connections)
     : url_(url),
-      nReceivedBytes_(0),
       outputPath_(output_path),
-      nConnections_(0),
+      maxConnections_(max_connections),
+      nReceivedBytes_(0),
       lastRequestedChunk_(0),
-      nDownloadedChunks_(0) {
+      nDownloadedChunks_(0),
+      nConnections_(0) {
+  createdAt_ = GetUnixTimestamp();
+  updatedAt_ = createdAt_;
   state_ = DownloadState::Uninitialized;
 };
+
+DownloadJob::DownloadJob(const JobImage& image,
+                         std::function<void(DownloadJob*)> start_download)
+    : nConnections_(0) {
+  url_ = ParseUrl(image.url);  // TODO: this url could end up be redirected, we
+                               // should make sure its valid
+  outputPath_ = image.file_path;
+
+  is_initialized_ = true;
+  state_ = DownloadState::Initialized;
+
+  fileSize_ = image.file_size;
+  ranged_ = image.ranged;
+  maxConnections_ = ranged_ ? image.max_connections : 1;
+  etag_ = image.etag;
+  lastModified_ = image.last_modified;
+  createdAt_ = image.created_at;
+  updatedAt_ = image.updated_at;
+  writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
+  start_download_ = start_download;
+  imageStored_ = true;
+
+  chunksInfo_.resize(image.chunks.size());
+  size_t i = 0;
+  size_t already_downloaded = 0;
+  for (const auto& c : image.chunks) {
+    auto& chunk = chunksInfo_.at(i);
+    chunk.index = i;
+    chunk.startRange_ = c.start_range;
+    chunk.endRange_ = c.end_range;
+    chunk.UpdateReceived(c.downloaded);
+    already_downloaded += c.downloaded;
+
+    i++;
+  }
+
+  size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
+  nChunks_ = chunksInfo_.size();
+  lastRequestedChunk_ = first_unfinished_index;
+  nDownloadedChunks_ = first_unfinished_index;
+  nReceivedBytes_ = already_downloaded;
+}
 
 void DownloadJob::Init(size_t file_size, bool ranged, size_t n_chunks,
                        std::function<void(DownloadJob*)> start_download) {
   is_initialized_ = true;
   fileSize_ = file_size;
   ranged_ = ranged;
+  maxConnections_ = ranged ? maxConnections_ : 1;
   writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
   nChunks_ = n_chunks;
   chunksInfo_.resize(n_chunks);
   start_download_ = start_download;
-  chunkSize_ = static_cast<size_t>((fileSize_ + nChunks_ - 1) / nChunks_);
+  size_t chunk_size_org =
+      static_cast<size_t>((fileSize_ + nChunks_ - 1) / nChunks_);
   for (size_t i = 0; i < nChunks_; i++) {
     auto& chunk = chunksInfo_.at(i);
     chunk.index = i;
-    chunk.startRange_ = i * chunkSize_;
+    chunk.startRange_ = i * chunk_size_org;
 
-    auto chunk_size = chunkSize_;
     if (i == nChunks_ - 1) {
-      chunk_size -= chunkSize_ * nChunks_ - fileSize_;
+      chunk.endRange_ = fileSize_ - 1;
+    } else {
+      chunk.endRange_ = chunk.startRange_ + chunk_size_org - 1;
     }
-    chunk.endRange_ = chunk.startRange_ + chunk_size - 1;
   }
   this->SetState(DownloadState::Initialized);
+}
+
+void DownloadJob::SetValidators(const std::string& etag,
+                                const std::string& last_modified) {
+  etag_ = etag;
+  lastModified_ = last_modified;
 }
 
 bool DownloadJob::IsInitialized() const { return is_initialized_; }
@@ -54,6 +122,10 @@ void DownloadJob::SetUrl(const Url& url) { url_ = url; }
 const Url& DownloadJob::GetUrl() const { return url_; }
 
 bool DownloadJob::IsRanged() const { return ranged_; }
+
+std::string DownloadJob::GetIdentityKey() const {
+  return outputPath_ + "\n" + GetUrlString(url_);
+}
 
 ssize_t DownloadJob::GetNextChunkIndex() {
   size_t index = lastRequestedChunk_.fetch_add(1);
@@ -138,7 +210,7 @@ bool DownloadJob::SetState(DownloadState next_state) {
         }
 
         // clean up chunks and reset counts
-        size_t first_unfinished_index = CleanUpChunks();
+        size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
         nChunks_ = chunksInfo_.size();
         lastRequestedChunk_ = first_unfinished_index;
         nDownloadedChunks_ = first_unfinished_index;
@@ -169,31 +241,38 @@ DownloadJob::DownloadState DownloadJob::GetState() const {
   return state_.load();
 }
 
-bool DownloadJob::NeedsStore() const {
-  // TODO: maybe we can use this function for special events
-  return nReceivedBytes_ >= 10 * 1024 * 1024;  // 10 MB
-}
-
 void DownloadJob::Store() {
   // this function is called mainly for 2 reasons:
   // 1) periodic disk update.
   // 2) special events such as failed downloads (the user may like to retry
   // downloading  after the issue is resolved)
 
-  auto chunks = std::vector<UnFinishedChunk>();
+  auto chunks = std::vector<ChunkState>();
   for (const auto& c : chunksInfo_) {
-    if (!c.IsFinished()) {
-      chunks.emplace_back(
-          UnFinishedChunk{.start_range = c.startRange_ + c.GetReceivedSize(),
-                          .end_range = c.endRange_});
-    }
+    chunks.emplace_back(ChunkState{.start_range = c.startRange_,
+                                   .end_range = c.endRange_,
+                                   .downloaded = c.GetReceivedSize()});
   }
 
   // create a job image and write it to disk
   JobImage img = {.file_path = writer_->filePath_,
+                  .file_size = fileSize_,
+                  .max_connections = maxConnections_,
+                  .ranged = ranged_,
                   .url = GetUrlString(url_),
+                  .etag = etag_,
+                  .last_modified = lastModified_,
+                  .created_at = createdAt_,
+                  .updated_at = GetUnixTimestamp(),
                   .chunks = chunks};
-  WriteImageToDisk(img, writer_->filePath_ + ".muld");
+  const std::string image_path = writer_->filePath_ + ".muld";
+  const bool updated =
+      imageStored_ &&
+      UpdateImageChunksOnDisk(image_path, imageIndex_, chunks, img.updated_at);
+  if (!updated) {
+    imageStored_ = WriteImageToDisk(img, image_path, &imageIndex_);
+  }
+  updatedAt_ = img.updated_at;
 
   // reset bytes read
   nReceivedBytes_ = 0;
@@ -226,44 +305,47 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
   }
 }
 
-size_t DownloadJob::CleanUpChunks() {
-  size_t originalSize = chunksInfo_.size();
+size_t DownloadJob::CleanUpChunks(std::vector<ChunkInfo>& chunks) {
+  size_t originalSize = chunks.size();
 
   for (size_t i = 0; i < originalSize; ++i) {
-    size_t receivedSoFar = chunksInfo_[i].GetReceivedSize();
+    size_t receivedSoFar = chunks[i].GetReceivedSize();
 
-    if (!chunksInfo_[i].IsFinished() && receivedSoFar > 0) {
-      // create the finished sub-chunk representing the completed part
+    if (!chunks[i].IsFinished() && receivedSoFar > 0) {
+      // create the finished sub-chunk
       ChunkInfo finishedPart;
-      finishedPart.index = chunksInfo_[i].index;  // Inherits the same chunk ID
-      finishedPart.startRange_ = chunksInfo_[i].startRange_;
-      finishedPart.endRange_ = chunksInfo_[i].startRange_ + receivedSoFar - 1;
-      finishedPart.UpdateReceived(
-          receivedSoFar);  // This makes IsFinished() return true
+      finishedPart.index = chunks[i].index;
+      finishedPart.startRange_ = chunks[i].startRange_;
+      finishedPart.endRange_ = chunks[i].startRange_ + receivedSoFar - 1;
+      finishedPart.UpdateReceived(receivedSoFar);
 
       // create the remaining unfinished sub-chunk
       ChunkInfo unfinishedPart;
-      unfinishedPart.index = chunksInfo_[i].index;
-      unfinishedPart.startRange_ = chunksInfo_[i].startRange_ + receivedSoFar;
-      unfinishedPart.endRange_ = chunksInfo_[i].endRange_;
-      // received_ naturally defaults to 0
+      unfinishedPart.index = chunks[i].index;
+      unfinishedPart.startRange_ = chunks[i].startRange_ + receivedSoFar;
+      unfinishedPart.endRange_ = chunks[i].endRange_;
 
-      // replace the current item with the unfinished part
-      chunksInfo_[i] = std::move(unfinishedPart);
-      chunksInfo_.push_back(std::move(finishedPart));
+      // modify the existing vector directly
+      chunks[i] = std::move(unfinishedPart);
+      chunks.push_back(std::move(finishedPart));
     }
   }
 
   auto unfinished_begin = std::stable_partition(
-      chunksInfo_.begin(), chunksInfo_.end(),
+      chunks.begin(), chunks.end(),
       [](const ChunkInfo& chunk) { return chunk.IsFinished(); });
 
-  for (size_t i = 0; i < chunksInfo_.size(); ++i) {
-    chunksInfo_[i].index = i;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    chunks[i].index = i;
   }
 
-  // the index of the first unfinished chunk
-  return std::distance(chunksInfo_.begin(), unfinished_begin);
+  // just return the index
+  return std::distance(chunks.begin(), unfinished_begin);
+}
+
+bool DownloadJob::NeedsStore() const {
+  // TODO: maybe we can use this function for special events
+  return nReceivedBytes_ >= 10 * 1024 * 1024;  // 10 MB
 }
 
 }  // namespace muld

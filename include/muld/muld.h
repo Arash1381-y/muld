@@ -1,6 +1,9 @@
 #pragma once
 #include <functional>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <memory>
 #include <string>
 
 namespace muld {
@@ -99,6 +102,7 @@ class DownloadHandler {
 ///////////////////////////////////////
 ////////// muld downloader ////////////
 ///////////////////////////////////////
+class ThreadPool;
 
 struct MuldConfig {
   int max_threads = 8;  // maximum threads in thread pool
@@ -111,7 +115,6 @@ struct MuldRequest {
   int max_connections;
 };
 
-class ThreadPool;
 class MuldDownloadManager {
  public:
   // constructor
@@ -122,10 +125,17 @@ class MuldDownloadManager {
   void WaitAll();
   void Terminate();
 
+  DownloadHandler Load(const std::string& path);
+
  private:
+  void EnqueueTasks(DownloadJob* job, int connections);
+
+ private:
+  LogCallback logger_;
   std::unique_ptr<ThreadPool> threadpool_;
   std::vector<std::shared_ptr<DownloadJob>> jobs_;
-  LogCallback logger_;
+  std::unordered_map<std::string, std::weak_ptr<DownloadJob>> jobs_index_;
+  std::unordered_set<std::string> loaded_images_;
 };
 
 ///////////////////////////////////////

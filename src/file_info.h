@@ -12,6 +12,8 @@ struct FileInfo {
   std::size_t total_size = 0;
   bool supports_range = false;
   bool is_valid = false;
+  std::string etag;
+  std::string last_modified;
 };
 
 struct FetchError {

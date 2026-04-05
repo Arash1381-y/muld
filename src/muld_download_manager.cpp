@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <filesystem>
 #include <string>
 
 #include "downloader.h"
@@ -27,6 +28,45 @@ constexpr size_t MIN_CHUNK_SIZE = 1 * 1024 * 1024;   // 1 MB
 constexpr size_t MAX_CHUNK_SIZE = 10 * 1024 * 1024;  // 10 MB
 
 namespace muld {
+
+namespace {
+
+std::optional<FileInfo> ResolveValidatedFileInfo(const Url& initial_url,
+                                                 Url& resolved_url) {
+  FetchResult fetch_res;
+  resolved_url = initial_url;
+
+  for (int redirect_count = 0; redirect_count < MAX_REDIRECT_ALLOW;
+       redirect_count++) {
+    fetch_res = NetDownloader::FetchFileInfo(resolved_url);
+    if (fetch_res.state == FetchResult::State::SUCCESSFUL) {
+      return std::get<FileInfo>(fetch_res.data);
+    }
+    if (fetch_res.state != FetchResult::State::REDIRECT) {
+      return std::nullopt;
+    }
+
+    resolved_url = ParseUrl(std::get<FetchRedirect>(fetch_res.data).new_url);
+  }
+
+  return std::nullopt;
+}
+
+bool MatchesStoredFile(const JobImage& img, const FileInfo& info) {
+  if (img.file_size > 0 && info.total_size > 0 && img.file_size != info.total_size) {
+    return false;
+  }
+  if (!img.etag.empty() && !info.etag.empty() && img.etag != info.etag) {
+    return false;
+  }
+  if (!img.last_modified.empty() && !info.last_modified.empty() &&
+      img.last_modified != info.last_modified) {
+    return false;
+  }
+  return true;
+}
+
+}
 
 MuldDownloadManager::~MuldDownloadManager() = default;
 
@@ -46,8 +86,9 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   Url parsed_url = ParseUrl(request.url);
 
   // initialize job
-  auto job = std::make_shared<DownloadJob>(parsed_url, request.destination);
+  auto job = std::make_shared<DownloadJob>(parsed_url, request.destination, request.max_connections);
   jobs_.push_back(job);
+  jobs_index_[job->GetIdentityKey()] = job;
 
   FetchResult fetch_res;
   for (int redirect_count = 0; redirect_count < MAX_REDIRECT_ALLOW;
@@ -138,12 +179,14 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
         std::max(MIN_CHUNK_SIZE, std::min(MAX_CHUNK_SIZE, ideal_chunk_size));
 
     n_chunks = static_cast<int>((info.total_size + actual_chunk_size - 1) /
-                               actual_chunk_size);
+                                actual_chunk_size);
   }
 
-  job->Init(info.total_size, info.supports_range, n_chunks, [this, num_connections] (DownloadJob* job) {
-    this->EnqueueTasks(job, num_connections);
-  } );
+  job->Init(info.total_size, info.supports_range, n_chunks,
+            [this](DownloadJob* job) {
+              this->EnqueueTasks(job, job->maxConnections_);
+            });
+  job->SetValidators(info.etag, info.last_modified);
 
   // setting state to downloading will automatically create connections
   job->SetState(DownloadJob::DownloadState::Downloading);
@@ -161,9 +204,89 @@ void MuldDownloadManager::WaitAll() {
 void MuldDownloadManager::Terminate() {
   for (const auto& j : jobs_) {
     if (!j->IsFinished()) {
+      j->Store();
       j->SetState(DownloadJob::DownloadState::Canceled);
     }
   }
+}
+
+DownloadHandler MuldDownloadManager::Load(const std::string& path) {
+  auto make_failed_handler = [&](const Url& url, const std::string& output_path,
+                                 int max_connections, ErrorCode code,
+                                 const std::string& message) {
+    auto failed_job =
+        std::make_shared<DownloadJob>(url, output_path, max_connections);
+    failed_job->Fail(code, message);
+    jobs_.push_back(failed_job);
+    return DownloadHandler(failed_job.get());
+  };
+
+  JobImage img;
+  if (!ReadImageFromDisk(img, path)) {
+    return make_failed_handler(ParseUrl("http://invalid/"), "", 1,
+                               ErrorCode::SYSTEM_ERR,
+                               "Failed to read job image from disk");
+  }
+
+  if (!loaded_images_.insert(path).second) {
+    return make_failed_handler(ParseUrl(img.url), img.file_path,
+                               img.max_connections, ErrorCode::SYSTEM_ERR,
+                               "This job image is already loaded");
+  }
+
+  Url corrected_url;
+  auto info = ResolveValidatedFileInfo(ParseUrl(img.url), corrected_url);
+  if (!info.has_value()) {
+    loaded_images_.erase(path);
+    return make_failed_handler(ParseUrl(img.url), img.file_path,
+                               img.max_connections, ErrorCode::NETWORK_ERR,
+                               "Failed to validate stored job URL");
+  }
+
+  if (!MatchesStoredFile(img, *info)) {
+    loaded_images_.erase(path);
+    return make_failed_handler(corrected_url, img.file_path,
+                               img.max_connections, ErrorCode::HTTP_ERR,
+                               "Stored job image no longer matches remote file");
+  }
+
+  img.url = GetUrlString(corrected_url);
+  img.file_size = info->total_size;
+  img.ranged = info->supports_range;
+  img.max_connections = info->supports_range ? img.max_connections : 1;
+  img.etag = info->etag;
+  img.last_modified = info->last_modified;
+
+  const std::string identity_key = img.file_path + "\n" + img.url;
+  auto existing = jobs_index_.find(identity_key);
+  if (existing != jobs_index_.end() && !existing->second.expired()) {
+    loaded_images_.erase(path);
+    return make_failed_handler(corrected_url, img.file_path,
+                               img.max_connections, ErrorCode::SYSTEM_ERR,
+                               "An equivalent download job is already loaded");
+  }
+
+  if (!std::filesystem::exists(img.file_path)) {
+    loaded_images_.erase(path);
+    return make_failed_handler(corrected_url, img.file_path,
+                               img.max_connections, ErrorCode::DISK_ERR,
+                               "Target file is missing on disk");
+  }
+
+  auto local_size = std::filesystem::file_size(img.file_path);
+  if (img.file_size > 0 && local_size != img.file_size) {
+    loaded_images_.erase(path);
+    return make_failed_handler(
+        corrected_url, img.file_path, img.max_connections, ErrorCode::DISK_ERR,
+        "Target file size does not match stored job image");
+  }
+
+  auto job = std::make_shared<DownloadJob>(
+      img, [this](DownloadJob* job) { this->EnqueueTasks(job, job->maxConnections_); });
+
+  jobs_.push_back(job);
+  jobs_index_[job->GetIdentityKey()] = job;
+  return DownloadHandler(job.get());
 }
 
 }  // namespace muld

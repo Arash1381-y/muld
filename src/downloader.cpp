@@ -81,6 +81,12 @@ FileInfo createFileInfo(const http::response<http::empty_body>& resp) {
     info.supports_range = false;
   }
   info.total_size = std::stoull(std::string(resp[http::field::content_length]));
+  if (resp.count(http::field::etag)) {
+    info.etag = resp[http::field::etag].to_string();
+  }
+  if (resp.count(http::field::last_modified)) {
+    info.last_modified = resp[http::field::last_modified].to_string();
+  }
 
   return info;
 }

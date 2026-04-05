@@ -201,8 +201,6 @@ int main(int argc, char* argv[]) {
   auto start = std::chrono::steady_clock::now();
   auto last_tick = start;
 
-  std::cout << "\n\n";
-
   while (!handler.IsFinished()) {
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - last_tick).count();
@@ -256,7 +254,10 @@ int main(int argc, char* argv[]) {
             : 0.0f;
 
     // Build the active chunks summary string
-    std::string active_str = "Active Chunks: ";
+    std::string active_str =
+        std::to_string(active_chunks_info.size()) + " Active Chunks: ";
+
+
     for (const auto& ac : active_chunks_info) active_str += ac + " ";
     if (active_str.length() > 80)
       active_str = active_str.substr(0, 77) +
@@ -268,8 +269,7 @@ int main(int argc, char* argv[]) {
               << chunk_percent << "% "
               << "[" << BuildGlobalProgressBar(chunks, total_chunk_size, 40)
               << "] " << std::setw(9) << FormatBytes(total_chunk_downloaded)
-              << " / " << std::setw(9) << FormatBytes(total_chunk_size) << " | "
-              << std::setw(9)
+              << " / " << FormatBytes(total_chunk_size) << " | " << std::setw(9)
               << FormatBytes(static_cast<std::size_t>(smoothed_speed))
               << "/s | "
               << "ETA " << FormatTime(eta) << "\n";
