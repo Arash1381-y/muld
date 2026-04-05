@@ -13,4 +13,6 @@ struct Url {
 
 Url ParseUrl(const std::string& url_string);
 
+std::string GetUrlString(const Url& url);
+
 }  // namespace muld
