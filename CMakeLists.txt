@@ -29,6 +29,7 @@ add_library(muld STATIC
     src/chunk_info.h
     src/download_handler.h
     src/download_job.h
+    src/download_job.cpp
     src/downloader.h
     src/error.h
     src/file_info.h
