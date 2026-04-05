@@ -21,13 +21,16 @@ struct ChunkProgress {
 
 class DownloadHandler {
  public:
-  explicit DownloadHandler(DownloadJob* job); 
+  explicit DownloadHandler(DownloadJob* job);
 
   DownloadProgress GetProgress() const;
   std::vector<ChunkProgress> GetChunksProgress() const;
   bool IsFinished() const;
+  bool HasError() const;
   const MuldError& GetError() const;
   void Wait() const;
+  bool Pause();
+  bool Resume();
 
  private:
   DownloadJob* job_;

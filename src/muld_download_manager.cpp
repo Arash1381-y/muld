@@ -36,6 +36,12 @@ MuldDownloadManager::MuldDownloadManager(const MuldConfig& config)
           config.max_threads,
           [](const Task& task) { NetDownloader::DownloadWorker(task); })) {}
 
+void MuldDownloadManager::EnqueueTasks(DownloadJob* job, int num_connections) {
+  for (int i = 0; i < num_connections; i++) {
+    threadpool_->Enqueue({.job = job, .logger = this->logger_});
+  }
+}
+
 DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   Url parsed_url = ParseUrl(request.url);
 
@@ -89,7 +95,7 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
       if (logger_) {
         logger_(LogLevel::Error, "HTTP request failed: " + err.message);
       }
-      job->Fail(err.error_code, err.https_status_code, err.message);
+      job->Fail(err.error_code, err.message, err.https_status_code);
       return DownloadHandler(job.get());  // Return gracefully failed handler
     }
   }
@@ -123,7 +129,7 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
   }
 
   int num_connections = info.supports_range ? request.max_connections : 1;
-  int nChunks = 1;
+  int n_chunks = 1;
 
   if (info.supports_range && info.total_size > 0) {
     size_t ideal_chunk_size = info.total_size / (num_connections * 4);
@@ -131,15 +137,16 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
     size_t actual_chunk_size =
         std::max(MIN_CHUNK_SIZE, std::min(MAX_CHUNK_SIZE, ideal_chunk_size));
 
-    nChunks = static_cast<int>((info.total_size + actual_chunk_size - 1) /
+    n_chunks = static_cast<int>((info.total_size + actual_chunk_size - 1) /
                                actual_chunk_size);
   }
 
+  job->Init(info.total_size, info.supports_range, n_chunks, [this, num_connections] (DownloadJob* job) {
+    this->EnqueueTasks(job, num_connections);
+  } );
+
+  // setting state to downloading will automatically create connections
   job->SetState(DownloadJob::DownloadState::Downloading);
-  job->Init(info.total_size, info.supports_range, nChunks);
-  for (int i = 0; i < num_connections; i++) {
-    threadpool_->Enqueue({.job = job.get(), .logger = this->logger_});
-  }
 
   auto handler = DownloadHandler(job.get());
   return handler;
@@ -153,7 +160,6 @@ void MuldDownloadManager::WaitAll() {
 
 void MuldDownloadManager::Terminate() {
   for (const auto& j : jobs_) {
-    // TODO: fix race condition on checking finish and changing state
     if (!j->IsFinished()) {
       j->SetState(DownloadJob::DownloadState::Canceled);
     }

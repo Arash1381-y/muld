@@ -43,8 +43,26 @@ std::vector<ChunkProgress> DownloadHandler::GetChunksProgress() const {
 
 bool DownloadHandler::IsFinished() const { return job_->IsFinished(); }
 
+bool DownloadHandler::HasError() const {
+  return job_->GetError().code != ErrorCode::Success;
+}
+
 const MuldError& DownloadHandler::GetError() const { return job_->GetError(); }
 
 void DownloadHandler::Wait() const { job_->WaitUntilFinished(); }
+
+bool DownloadHandler::Pause() {
+  return job_->SetState(DownloadJob::DownloadState::Paused);
+}
+
+bool DownloadHandler::Resume() {
+  // we ask this because the job can be uninitialized and then failed
+  // so we have initialized and uninitialized failed jobs and we ignore
+  // uninitialized jobs resume
+  if (job_->IsInitialized())
+    return job_->SetState(DownloadJob::DownloadState::Downloading);
+
+  return false;
+}
 
 }  // namespace muld

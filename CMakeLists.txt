@@ -60,10 +60,21 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(muld PRIVATE $<$<CONFIG:Debug>:-O0 -g> $<$<CONFIG:Release>:-O3>)
 endif()
 
+# --- CLI Application ---
 add_executable(muld_cli src/muld_cli.cpp)
 set_target_properties(muld_cli PROPERTIES OUTPUT_NAME muld)
 target_include_directories(muld_cli PRIVATE include)
 target_link_libraries(muld_cli PRIVATE muld)
+
+# --- Tests ---
+enable_testing()
+
+add_executable(muld_test_pause_resume tests/test_pause_resume.cpp)
+target_link_libraries(muld_test_pause_resume PRIVATE muld)
+target_include_directories(muld_test_pause_resume PRIVATE include)
+
+# Register it with CTest
+add_test(NAME PauseResumeTest COMMAND muld_test_pause_resume)
 
 # Install the library, executable, and export the targets
 install(TARGETS muld_cli

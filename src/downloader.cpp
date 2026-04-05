@@ -29,6 +29,18 @@ template <typename T>
 concept StreamType = std::is_same_v<T, beast::tcp_stream> ||
     std::is_same_v<T, beast::ssl_stream<beast::tcp_stream>>;
 
+struct ConnectionGuard {
+  DownloadJob* job;
+  explicit ConnectionGuard(DownloadJob* j) : job(j) {
+    job->NotifyConnectionOpen();
+  }
+  ~ConnectionGuard() { job->NotifyConnectionClose(); }
+
+  // Prevent copying
+  ConnectionGuard(const ConnectionGuard&) = delete;
+  ConnectionGuard& operator=(const ConnectionGuard&) = delete;
+};
+
 // Custom exceptions for clean error routing
 struct HttpException : public std::runtime_error {
   int status_code;
@@ -64,6 +76,8 @@ FileInfo createFileInfo(const http::response<http::empty_body>& resp) {
       resp[http::field::accept_ranges] == "bytes") {
     info.supports_range = true;
   } else {
+    // TODO: sometimes server support ranges but they do not include range
+    // header so maybe we can send a simple 10 byte range and check the response
     info.supports_range = false;
   }
   info.total_size = std::stoull(std::string(resp[http::field::content_length]));
@@ -107,6 +121,12 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
     parser.get().body().data = body_buffer;
     parser.get().body().size = BUFFER_SIZE;
 
+    // we only check the state before doing the read. after that
+    // no matter what we write on disk and notify the job
+    if (job->GetState() != DownloadJob::DownloadState::Downloading) {
+      return false;
+    }
+
     beast::error_code ec;
     http::read(stream, buffer, parser, ec);
 
@@ -114,10 +134,6 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
     if (bytes_read > 0) {
       size_t bytes_write = 0;
       while (bytes_write < bytes_read) {
-        if (job->GetState() != DownloadJob::DownloadState::Downloading) {
-          return false;
-        }
-
         ssize_t bw =
             job->GetWriter().Write(body_buffer + bytes_write,
                                    bytes_read - bytes_write, current_offset);
@@ -129,9 +145,6 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
         current_offset += static_cast<size_t>(bw);
       }
 
-      // TODO: we have a race here [pass the downloading check but after that
-      // the states changes hence this line notify chunk receive of a stoped
-      // task]
       job->NotifyChunkReceived(chunk.index, bytes_read);
     }
 
@@ -258,6 +271,10 @@ void DownloadWorkerImpl(const Task& task,
       // TODO: seems we do not give up on a request. is this the correct way?
       // Keep downloading until this chunk is perfectly finished
       while (!chunk_finished) {
+        if (job->GetState() != DownloadJob::DownloadState::Downloading) {
+          return;
+        }
+
         if (!is_connected) {
           connect_stream();
           is_connected = true;
@@ -311,13 +328,17 @@ void DownloadWorkerImpl(const Task& task,
     }
 
   } catch (HttpException const& e) {
-    job->Fail(ErrorCode::HTTP_ERR, e.status_code, e.what());
+    // http error
+    job->Fail(ErrorCode::HTTP_ERR, e.what(), e.status_code);
   } catch (DiskException const& e) {
+    // disk write error
     job->Fail(ErrorCode::DISK_ERR, e.what());
   } catch (beast::system_error const& e) {
+    // system error
     job->Fail(ErrorCode::NETWORK_ERR,
               std::string("Network interrupted: ") + e.what());
   } catch (std::exception const& e) {
+    // others
     job->Fail(ErrorCode::SYSTEM_ERR,
               std::string("Unexpected system error: ") + e.what());
   }
@@ -377,6 +398,8 @@ void DownloadWorker(const Task& task) {
   const auto& job = task.job;
   const auto& url = job->GetUrl();
 
+  ConnectionGuard guard(job);
+
   try {
     net::io_context ioc;
     tcp::resolver resolver(ioc);
@@ -394,13 +417,16 @@ void DownloadWorker(const Task& task) {
       DownloadWorkerImpl<beast::ssl_stream<beast::tcp_stream>>(task, results,
                                                                &ctx);
     } else {
+      // scheme not supported
       job->Fail(ErrorCode::NotSupported,
                 "Scheme " + url.scheme + " is not supported");
     }
   } catch (beast::system_error const& e) {
+    // system error
     job->Fail(ErrorCode::NETWORK_ERR,
               std::string("DNS Resolution/Setup failed: ") + e.what());
   } catch (std::exception const& e) {
+    // network error
     job->Fail(ErrorCode::SYSTEM_ERR,
               std::string("Unexpected setup error: ") + e.what());
   }

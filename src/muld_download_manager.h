@@ -28,6 +28,11 @@ class MuldDownloadManager {
   void WaitAll();
   void Terminate();
 
+  void Store();
+
+ private:
+  void EnqueueTasks(DownloadJob* job, int connections);
+
  private:
   LogCallback logger_;
   std::unique_ptr<ThreadPool> threadpool_;

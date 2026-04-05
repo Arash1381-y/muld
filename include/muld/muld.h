@@ -59,6 +59,9 @@ struct MuldError {
   explicit operator bool() const { return code != ErrorCode::Success; }
 };
 
+///////////////////////////////////////
+////////////// handler ////////////////
+///////////////////////////////////////
 struct DownloadProgress {
   std::size_t total_bytes;
   std::size_t downloaded_bytes;
@@ -79,12 +82,23 @@ class DownloadHandler {
   DownloadProgress GetProgress() const;
   std::vector<ChunkProgress> GetChunksProgress() const;
   bool IsFinished() const;
+  bool HasError() const;
   const MuldError& GetError() const;
   void Wait() const;
+  bool Pause();
+  bool Resume();
 
  private:
   DownloadJob* job_;
 };
+
+///////////////////////////////////////
+///////////////////////////////////////
+///////////////////////////////////////
+
+///////////////////////////////////////
+////////// muld downloader ////////////
+///////////////////////////////////////
 
 struct MuldConfig {
   int max_threads = 8;  // maximum threads in thread pool
@@ -113,5 +127,9 @@ class MuldDownloadManager {
   std::vector<std::shared_ptr<DownloadJob>> jobs_;
   LogCallback logger_;
 };
+
+///////////////////////////////////////
+///////////////////////////////////////
+///////////////////////////////////////
 
 }  // namespace muld
