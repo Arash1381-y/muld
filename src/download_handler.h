@@ -17,8 +17,9 @@ struct HandlerResp {
 struct DownloadProgress {
   std::size_t total_bytes;
   std::size_t downloaded_bytes;
+  std::size_t speed_bytes_per_sec;
+  std::size_t eta_seconds;
   float percentage;
-  bool is_complete;
 };
 
 struct ChunkProgress {
@@ -38,6 +39,7 @@ class DownloadHandler {
   void Wait() const;
   HandlerResp Pause();
   HandlerResp Resume();
+  HandlerResp Cancel();
 
  private:
   std::weak_ptr<DownloadJob> job_;

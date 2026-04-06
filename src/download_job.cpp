@@ -31,15 +31,20 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
       url_(url),
       outputPath_(output_path),
       fileSize_(file_size),
+      nTotalReceivedBytes_(0),
       nChunks_(n_chunks),
-      nReceivedBytes_(0),
+      nReceivedBytesFromLastStore_(0),
       lastRequestedChunk_(0),
       nDownloadedChunks_(0),
+      lastSpeedCalcTime_(std::chrono::steady_clock::now()),
+      nBytesFromLastSpeedCalc_(0),
+      downloadSpeed_(0),  // (bytes / per sec)
+      eta_(0),            // download job eta
       nConnections_(0),
       start_download_(start_download) {
+  state_ = DownloadState::Initialized;
   createdAt_ = GetUnixTimestamp();
   updatedAt_ = createdAt_;
-  state_ = DownloadState::Uninitialized;
   maxConnections_ = ranged_ ? maxConnections_ : 1;
   writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
   chunksInfo_.resize(nChunks_);
@@ -57,19 +62,18 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
       chunk.endRange_ = chunk.startRange_ + chunk_size_org - 1;
     }
   }
-
-  this->SetState(DownloadState::Initialized);
 }
 
 DownloadJob::DownloadJob(const JobImage& image,
                          std::function<void(DownloadJob*)> start_download)
-    : nConnections_(0) {
-  url_ = ParseUrl(image.url);  // TODO: this url could end up be redirected, we
-                               // should make sure its valid
-  outputPath_ = image.file_path;
-
+    : lastSpeedCalcTime_(std::chrono::steady_clock::now()),
+      nBytesFromLastSpeedCalc_(0),
+      downloadSpeed_(0),  // (bytes / per sec)
+      eta_(0),            // download job eta
+      nConnections_(0) {
   state_ = DownloadState::Initialized;
-
+  url_ = ParseUrl(image.url);
+  outputPath_ = image.file_path;
   fileSize_ = image.file_size;
   ranged_ = image.ranged;
   maxConnections_ = ranged_ ? image.max_connections : 1;
@@ -99,7 +103,8 @@ DownloadJob::DownloadJob(const JobImage& image,
   nChunks_ = chunksInfo_.size();
   lastRequestedChunk_ = first_unfinished_index;
   nDownloadedChunks_ = first_unfinished_index;
-  nReceivedBytes_ = already_downloaded;
+  nTotalReceivedBytes_ = already_downloaded;
+  nReceivedBytesFromLastStore_ = already_downloaded;
 }
 
 void DownloadJob::SetValidators(const std::string& etag,
@@ -145,14 +150,46 @@ size_t DownloadJob::GetNumChunks() const { return nChunks_; }
 
 const MuldError& DownloadJob::GetError() const { return error_; }
 
+size_t DownloadJob::GetTotalSize() const { return fileSize_; };
+
+size_t DownloadJob::GetReceivedSize() const {
+  return nTotalReceivedBytes_.load();
+};
+
+size_t DownloadJob::GetDownloadSpeed() const { return downloadSpeed_.load(); };
+
+size_t DownloadJob::GetJobEta() const { return eta_.load(); };
+
 void DownloadJob::NotifyChunkReceived(size_t index, size_t bytes) {
   auto& chunk = chunksInfo_.at(index);
   chunk.UpdateReceived(bytes);
 
+  // check the timer and update the speed if needed
+  nBytesFromLastSpeedCalc_.fetch_add(bytes);
+  nTotalReceivedBytes_.fetch_add(bytes);
+  auto now = std::chrono::steady_clock::now();
+  double dt = std::chrono::duration<double>(now - lastSpeedCalcTime_).count();
+  if (dt > 0.5) {
+    std::lock_guard<std::mutex> speed_lock(speed_mtx_);
+    now = std::chrono::steady_clock::now();
+    dt = std::chrono::duration<double>(now - lastSpeedCalcTime_).count();
+    if (dt > 0.5) {
+      // compute speed and eta
+      downloadSpeed_.store(nBytesFromLastSpeedCalc_ / dt);
+      eta_.store((fileSize_ - nTotalReceivedBytes_) / downloadSpeed_);
+
+      // reset states
+      nBytesFromLastSpeedCalc_ = 0;
+      lastSpeedCalcTime_ = now;
+    }
+
+    // TODO: maybe we could notify all locks after updating speed and eta?
+  }
+
   {
     std::lock_guard<std::mutex> disk_lock(disk_mtx_);
     // update number of unwritten bytes to image
-    nReceivedBytes_ += bytes;
+    nReceivedBytesFromLastStore_ += bytes;
 
     if (NeedsStore()) {
       Store();
@@ -196,10 +233,12 @@ void DownloadJob::WaitUntilFinished() {
 
 bool DownloadJob::SetState(DownloadState next_state) {
   if (next_state == DownloadState::Downloading) {
+    // RESUME DOWNLOADING STATE
     auto current = state_.load();
-    while (current == DownloadJob::DownloadState::Initialized ||
-           current == DownloadJob::DownloadState::Paused ||
-           current == DownloadJob::DownloadState::Failed) {
+    while (current == DownloadState::Initialized ||
+           current == DownloadState::Paused ||
+           current == DownloadState::Canceled ||
+           current == DownloadState::Failed) {
       if (state_.compare_exchange_strong(current, DownloadState::Downloading)) {
         while (nConnections_.load() !=
                0) { /* busy wait for connection close after pause or failed */
@@ -216,8 +255,8 @@ bool DownloadJob::SetState(DownloadState next_state) {
       }
     }
     return false;
-
   } else if (next_state == DownloadState::Paused) {
+    // PAUSE DOWNLOADING STATE
     auto expected = DownloadState::Downloading;
     if (state_.compare_exchange_strong(expected, DownloadState::Paused)) {
       // wake any threads waiting for IsFinished()
@@ -227,15 +266,26 @@ bool DownloadJob::SetState(DownloadState next_state) {
     } else {
       return false;
     }
+  } else if (next_state == DownloadState::Canceled) {
+    // CANCEL JOB
+    auto current = state_.load();
+    while (current == DownloadState::Downloading ||
+           current == DownloadState::Paused ||
+           current == DownloadState::Failed) {
+      if (state_.compare_exchange_strong(current, DownloadState::Canceled)) {
+        std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+        wait_cv_.notify_all();
+        return true;
+      }
+    }
+    return false;
   } else {
     state_.store(next_state);
     return true;
   }
 }
 
-DownloadJob::DownloadState DownloadJob::GetState() const {
-  return state_.load();
-}
+DownloadState DownloadJob::GetState() const { return state_.load(); }
 
 void DownloadJob::Store() {
   // this function is called mainly for 2 reasons:
@@ -271,7 +321,7 @@ void DownloadJob::Store() {
   updatedAt_ = img.updated_at;
 
   // reset bytes read
-  nReceivedBytes_ = 0;
+  nReceivedBytesFromLastStore_ = 0;
 }
 
 void DownloadJob::Fail(ErrorCode code, const std::string& detail,
@@ -279,8 +329,7 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
   auto current_state = state_.load();
 
   // Loop because state might change between load and CAS
-  while (current_state == DownloadState::Downloading ||
-         current_state == DownloadState::Uninitialized) {
+  while (current_state == DownloadState::Downloading) {
     if (state_.compare_exchange_strong(current_state, DownloadState::Failed)) {
       std::lock_guard<std::mutex> disk_lock(disk_mtx_);
       this->Store();
@@ -339,7 +388,7 @@ size_t DownloadJob::CleanUpChunks(std::vector<ChunkInfo>& chunks) {
 
 bool DownloadJob::NeedsStore() const {
   // TODO: maybe we can use this function for special events
-  return nReceivedBytes_ >= 10 * 1024 * 1024;  // 10 MB
+  return nReceivedBytesFromLastStore_ >= 10 * 1024 * 1024;  // 10 MB
 }
 
 }  // namespace muld

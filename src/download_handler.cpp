@@ -19,7 +19,7 @@ HandlerResp DownloadHandler::Pause() {
     };
   }
 
-  if (!job->SetState(DownloadJob::DownloadState::Paused)) {
+  if (!job->SetState(DownloadState::Paused)) {
     return {
         {.code = ErrorCode::InvalidState, .detail = "Invalid state change"},
     };
@@ -37,7 +37,24 @@ HandlerResp DownloadHandler::Resume() {
     };
   }
 
-  if (!job->SetState(DownloadJob::DownloadState::Downloading)) {
+  if (!job->SetState(DownloadState::Downloading)) {
+    return {MuldError{.code = ErrorCode::InvalidState,
+                      .detail = "Invalid state change"}};
+  } else {
+    return {MuldError()};
+  }
+}
+
+HandlerResp DownloadHandler::Cancel() {
+  auto job = job_.lock();
+  if (!job) {
+    return {
+        {.code = ErrorCode::NotInitialized,
+         .detail = "Handler references an invalid or expired job"},
+    };
+  }
+
+  if (!job->SetState(DownloadState::Canceled)) {
     return {MuldError{.code = ErrorCode::InvalidState,
                       .detail = "Invalid state change"}};
   } else {
@@ -67,22 +84,16 @@ bool DownloadHandler::HasError() const {
 
 DownloadProgress DownloadHandler::GetProgress() const {
   auto job = job_.lock();
-  DownloadProgress dp = {0, 0, 0.0f, false};
-
-  for (size_t i = 0; i < job->GetNumChunks(); i++) {
-    const auto& chunk_info = job->GetChunkInfo(i);
-    dp.total_bytes += chunk_info.GetTotalSize();
-    dp.downloaded_bytes += chunk_info.GetReceivedSize();
-  }
+  DownloadProgress dp;
+  dp.total_bytes = job->GetTotalSize();
+  dp.downloaded_bytes = job->GetReceivedSize();
+  dp.speed_bytes_per_sec = job->GetDownloadSpeed();
+  dp.eta_seconds = job->GetJobEta();
 
   if (dp.total_bytes > 0) {
     dp.percentage = static_cast<float>(dp.downloaded_bytes) /
                     static_cast<float>(dp.total_bytes) * 100;
   }
-
-  // Rely on the source of truth, not a floating point comparison
-  dp.is_complete = job->IsFinished();
-
   return dp;
 }
 

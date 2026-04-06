@@ -129,7 +129,7 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
 
     // we only check the state before doing the read. after that
     // no matter what we write on disk and notify the job
-    if (job->GetState() != DownloadJob::DownloadState::Downloading) {
+    if (job->GetState() != DownloadState::Downloading) {
       return false;
     }
 
@@ -277,7 +277,7 @@ void DownloadWorkerImpl(const Task& task,
       // TODO: seems we do not give up on a request. is this the correct way?
       // Keep downloading until this chunk is perfectly finished
       while (!chunk_finished) {
-        if (job->GetState() != DownloadJob::DownloadState::Downloading) {
+        if (job->GetState() != DownloadState::Downloading) {
           return;
         }
 

@@ -184,7 +184,7 @@ DownloaderResp MuldDownloadManager::Download(const MuldRequest& request) {
   jobs_index_[job->GetIdentityKey()] = job;
 
   job->SetValidators(info.etag, info.last_modified);
-  job->SetState(DownloadJob::DownloadState::Downloading);
+  job->SetState(DownloadState::Downloading);
 
   auto handler = DownloadHandler(job);
   return {job->GetError(), DownloadHandler(job)};
@@ -200,7 +200,7 @@ void MuldDownloadManager::Terminate() {
   for (const auto& j : jobs_) {
     if (!j->IsFinished()) {
       j->Store();
-      j->SetState(DownloadJob::DownloadState::Canceled);
+      j->SetState(DownloadState::Canceled);
     }
   }
 }
