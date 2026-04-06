@@ -25,7 +25,8 @@ std::uint64_t GetUnixTimestamp() {
 DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
                          int max_connections, size_t file_size, bool ranged,
                          size_t n_chunks,
-                         std::function<void(DownloadJob*)> start_download)
+                         std::function<void(DownloadJob*)> start_download,
+                         const DownloadCallbacks& callbacks)
     : maxConnections_(max_connections),
       ranged_(ranged),
       url_(url),
@@ -41,7 +42,8 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
       downloadSpeed_(0),  // (bytes / per sec)
       eta_(0),            // download job eta
       nConnections_(0),
-      start_download_(start_download) {
+      start_download_(start_download),
+      callbacks_(callbacks) {
   state_ = DownloadState::Initialized;
   createdAt_ = GetUnixTimestamp();
   updatedAt_ = createdAt_;
@@ -65,12 +67,14 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
 }
 
 DownloadJob::DownloadJob(const JobImage& image,
-                         std::function<void(DownloadJob*)> start_download)
+                         std::function<void(DownloadJob*)> start_download,
+                         const DownloadCallbacks& callbacks)
     : lastSpeedCalcTime_(std::chrono::steady_clock::now()),
       nBytesFromLastSpeedCalc_(0),
       downloadSpeed_(0),  // (bytes / per sec)
       eta_(0),            // download job eta
-      nConnections_(0) {
+      nConnections_(0),
+      callbacks_(callbacks) {
   state_ = DownloadState::Initialized;
   url_ = ParseUrl(image.url);
   outputPath_ = image.file_path;
@@ -111,6 +115,10 @@ void DownloadJob::SetValidators(const std::string& etag,
                                 const std::string& last_modified) {
   etag_ = etag;
   lastModified_ = last_modified;
+}
+
+void DownloadJob::AttachCallbacks(const DownloadCallbacks& callbacks) {
+  callbacks_ = callbacks;
 }
 
 void DownloadJob::NotifyConnectionOpen() { nConnections_.fetch_add(1); }
@@ -230,59 +238,149 @@ void DownloadJob::WaitUntilFinished() {
   std::unique_lock<std::mutex> lock(wait_mtx_);
   wait_cv_.wait(lock, [this]() { return IsFinished(); });
 }
+bool DownloadJob::Start() {
+  if (!SetState(DownloadState::Downloading)) return false;
+
+  // Wait for any dangling connections to close
+  while (nConnections_.load() != 0) {
+    std::this_thread::yield();
+  }
+
+  // clean up chunks and reset counts
+  size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
+  nChunks_ = chunksInfo_.size();
+  lastRequestedChunk_ = first_unfinished_index;
+  nDownloadedChunks_ = first_unfinished_index;
+
+  start_download_(this);
+
+  return true;
+}
+
+bool DownloadJob::Resume() {
+  if (!SetState(DownloadState::Downloading)) return false;
+
+  // Wait for any dangling connections to close
+  while (nConnections_.load() != 0) {
+    std::this_thread::yield();
+  }
+
+  // clean up chunks and reset counts
+  size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
+  nChunks_ = chunksInfo_.size();
+  lastRequestedChunk_ = first_unfinished_index;
+  nDownloadedChunks_ = first_unfinished_index;
+
+  start_download_(this);
+
+  return true;
+}
+
+bool DownloadJob::Pause() {
+  if (!SetState(DownloadState::Paused)) return false;
+
+  // Wake up any threads waiting on conditions
+  std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+  wait_cv_.notify_all();
+
+  return true;
+}
+
+bool DownloadJob::Cancel() {
+  if (!SetState(DownloadState::Canceled)) return false;
+
+  // Wake up any threads waiting on conditions
+  std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+  wait_cv_.notify_all();
+
+  // TODO: disk clean up
+
+  return true;
+}
+
+void DownloadJob::Fail(ErrorCode code, const std::string& detail,
+                       int http_status) {
+  if (!SetState(DownloadState::Failed)) return;
+
+  {
+    // write to disk the current progress
+    std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+    this->Store();
+  }
+
+  {
+    // set error
+    // Note: Yes, an error_mtx_ is a good idea if GUI threads 
+    // might read GetError() at the exact moment this writes.
+    std::lock_guard<std::mutex> error_lock(error_mtx_);
+    error_.code = code;
+    error_.detail = detail;
+    error_.http_status = http_status;
+  }
+
+  {
+    std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+    wait_cv_.notify_all();
+  }
+
+  if (callbacks_.on_error) {
+    callbacks_.on_error(error_);
+  }
+}
+
 
 bool DownloadJob::SetState(DownloadState next_state) {
+  bool state_changed = false;
+
   if (next_state == DownloadState::Downloading) {
-    // RESUME DOWNLOADING STATE
     auto current = state_.load();
     while (current == DownloadState::Initialized ||
            current == DownloadState::Paused ||
            current == DownloadState::Canceled ||
            current == DownloadState::Failed) {
       if (state_.compare_exchange_strong(current, DownloadState::Downloading)) {
-        while (nConnections_.load() !=
-               0) { /* busy wait for connection close after pause or failed */
-        }
-
-        // clean up chunks and reset counts
-        size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
-        nChunks_ = chunksInfo_.size();
-        lastRequestedChunk_ = first_unfinished_index;
-        nDownloadedChunks_ = first_unfinished_index;
-
-        start_download_(this);
-        return true;
+        state_changed = true;
+        break;
       }
     }
-    return false;
   } else if (next_state == DownloadState::Paused) {
-    // PAUSE DOWNLOADING STATE
     auto expected = DownloadState::Downloading;
     if (state_.compare_exchange_strong(expected, DownloadState::Paused)) {
-      // wake any threads waiting for IsFinished()
-      std::lock_guard<std::mutex> wait_lock(wait_mtx_);
-      wait_cv_.notify_all();
-      return true;
-    } else {
-      return false;
+      state_changed = true;
     }
   } else if (next_state == DownloadState::Canceled) {
-    // CANCEL JOB
     auto current = state_.load();
     while (current == DownloadState::Downloading ||
            current == DownloadState::Paused ||
            current == DownloadState::Failed) {
       if (state_.compare_exchange_strong(current, DownloadState::Canceled)) {
-        std::lock_guard<std::mutex> wait_lock(wait_mtx_);
-        wait_cv_.notify_all();
-        return true;
+        state_changed = true;
+        break;
       }
     }
-    return false;
+  } else if (next_state == DownloadState::Failed) {
+    auto current = state_.load();
+    while (current == DownloadState::Downloading) {
+      if (state_.compare_exchange_strong(current, DownloadState::Failed)) {
+        state_changed = true;
+        break;  // Ensure we break out of the loop on success!
+      }
+    }
   } else {
+    // FORCE OVERRIDE
     state_.store(next_state);
+    state_changed = true;
+  }
+
+  // TRIGGER CALLBACK ONLY IF SUCCESSFUL
+  if (state_changed) {
+    if (callbacks_.on_state_change) {
+      callbacks_.on_state_change(next_state);
+    }
     return true;
   }
+
+  return false;
 }
 
 DownloadState DownloadJob::GetState() const { return state_.load(); }
@@ -322,30 +420,6 @@ void DownloadJob::Store() {
 
   // reset bytes read
   nReceivedBytesFromLastStore_ = 0;
-}
-
-void DownloadJob::Fail(ErrorCode code, const std::string& detail,
-                       int http_status) {
-  auto current_state = state_.load();
-
-  // Loop because state might change between load and CAS
-  while (current_state == DownloadState::Downloading) {
-    if (state_.compare_exchange_strong(current_state, DownloadState::Failed)) {
-      std::lock_guard<std::mutex> disk_lock(disk_mtx_);
-      this->Store();
-
-      {
-        std::lock_guard<std::mutex> error_lock(error_mtx_);
-        error_.code = code;
-        error_.detail = detail;
-        error_.http_status = http_status;
-      }
-
-      std::lock_guard<std::mutex> wait_lock(wait_mtx_);
-      wait_cv_.notify_all();
-      return;  // Success
-    }
-  }
 }
 
 size_t DownloadJob::CleanUpChunks(std::vector<ChunkInfo>& chunks) {

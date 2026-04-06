@@ -14,32 +14,29 @@ struct HandlerResp {
   operator bool() const { return ok(); }
 };
 
-struct DownloadProgress {
-  std::size_t total_bytes;
-  std::size_t downloaded_bytes;
-  std::size_t speed_bytes_per_sec;
-  std::size_t eta_seconds;
-  float percentage;
-};
-
 struct ChunkProgress {
   std::size_t downloaded_bytes;
   std::size_t total_bytes;
 };
 
+
 class DownloadHandler {
  public:
   explicit DownloadHandler(std::weak_ptr<DownloadJob> job);
 
-  DownloadProgress GetProgress() const;
-  std::vector<ChunkProgress> GetChunksProgress() const;
-  bool IsFinished() const;
-  bool HasError() const;
-  const MuldError& GetError() const;
-  void Wait() const;
+  void AttachHandlerCallbacks(const DownloadCallbacks& callbacks);
+
   HandlerResp Pause();
   HandlerResp Resume();
   HandlerResp Cancel();
+  void Wait() const;
+
+  bool IsFinished() const;
+  bool HasError() const;
+
+  const MuldError& GetError() const;
+  DownloadProgress GetProgress() const;
+  std::vector<ChunkProgress> GetChunksProgress() const;
 
  private:
   std::weak_ptr<DownloadJob> job_;

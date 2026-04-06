@@ -133,6 +133,12 @@ auto cli_logger = [](muld::LogLevel level, const std::string& msg) {
   std::cout << std::flush;
 };
 
+void on_progress(const DownloadProgress& progress) {
+
+
+
+}
+
 // --- Main CLI Application ---
 int main(int argc, char* argv[]) {
   std::string url = "";

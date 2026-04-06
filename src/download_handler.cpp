@@ -8,6 +8,16 @@ namespace muld {
 DownloadHandler::DownloadHandler(std::weak_ptr<DownloadJob> job)
     : job_(std::move(job)) {}
 
+void DownloadHandler::AttachHandlerCallbacks(
+    const DownloadCallbacks& callbacks) {
+  auto job = job_.lock();
+  if (!job) {
+    return;
+  }
+
+  job->AttachCallbacks(callbacks);
+}
+
 void DownloadHandler::Wait() const { job_.lock()->WaitUntilFinished(); }
 
 HandlerResp DownloadHandler::Pause() {
@@ -19,7 +29,7 @@ HandlerResp DownloadHandler::Pause() {
     };
   }
 
-  if (!job->SetState(DownloadState::Paused)) {
+  if (!job->Pause()) {
     return {
         {.code = ErrorCode::InvalidState, .detail = "Invalid state change"},
     };
@@ -37,7 +47,7 @@ HandlerResp DownloadHandler::Resume() {
     };
   }
 
-  if (!job->SetState(DownloadState::Downloading)) {
+  if (!job->Resume()) {
     return {MuldError{.code = ErrorCode::InvalidState,
                       .detail = "Invalid state change"}};
   } else {
@@ -54,7 +64,7 @@ HandlerResp DownloadHandler::Cancel() {
     };
   }
 
-  if (!job->SetState(DownloadState::Canceled)) {
+  if (!job->Cancel()) {
     return {MuldError{.code = ErrorCode::InvalidState,
                       .detail = "Invalid state change"}};
   } else {

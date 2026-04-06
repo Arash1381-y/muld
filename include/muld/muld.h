@@ -104,6 +104,38 @@ struct MuldError {
 ///////////////////////////////////////
 
 ///////////////////////////////////////
+//// DOWNLOAD QUERY & CALLBACKS////////
+///////////////////////////////////////
+
+enum class DownloadState {
+  Initialized,
+  Queued,
+  Downloading,
+  Completed,
+  Failed,
+  Paused,
+  Canceled
+};
+
+struct DownloadProgress {
+  std::size_t total_bytes;
+  std::size_t downloaded_bytes;
+  std::size_t speed_bytes_per_sec;
+  std::size_t eta_seconds;
+  float percentage;
+};
+
+struct DownloadCallbacks {
+  std::function<void(const DownloadProgress&)> on_progress;
+  std::function<void(DownloadState)> on_state_change;
+  std::function<void()> on_finish;
+  std::function<void(MuldError)> on_error;
+};
+///////////////////////////////////////
+///////////////////////////////////////
+///////////////////////////////////////
+
+///////////////////////////////////////
 ////////////// handler ////////////////
 ///////////////////////////////////////
 class DownloadJob;
@@ -115,14 +147,6 @@ struct HandlerResp {
   operator bool() const { return ok(); }
 };
 
-struct DownloadProgress {
-  std::size_t total_bytes;
-  std::size_t downloaded_bytes;
-  std::size_t speed_bytes_per_sec;
-  std::size_t eta_seconds;
-  float percentage;
-};
-
 struct ChunkProgress {
   std::size_t downloaded_bytes;
   std::size_t total_bytes;
@@ -132,15 +156,19 @@ class DownloadHandler {
  public:
   explicit DownloadHandler(std::weak_ptr<DownloadJob> job);
 
-  DownloadProgress GetProgress() const;
-  std::vector<ChunkProgress> GetChunksProgress() const;
-  bool IsFinished() const;
-  bool HasError() const;
-  const MuldError& GetError() const;
-  void Wait() const;
+  void AttachHandlerCallbacks(const DownloadCallbacks& callbacks);
+
   HandlerResp Pause();
   HandlerResp Resume();
   HandlerResp Cancel();
+  void Wait() const;
+
+  bool IsFinished() const;
+  bool HasError() const;
+
+  const MuldError& GetError() const;
+  DownloadProgress GetProgress() const;
+  std::vector<ChunkProgress> GetChunksProgress() const;
 
  private:
   std::weak_ptr<DownloadJob> job_;
@@ -180,8 +208,11 @@ class MuldDownloadManager {
   explicit MuldDownloadManager(const MuldConfig& config);
   ~MuldDownloadManager();
 
-  DownloaderResp Load(const std::string& path);
-  DownloaderResp Download(const MuldRequest& request);
+  DownloaderResp Load(const std::string& path,
+                      const DownloadCallbacks& callbacks = {});
+  DownloaderResp Download(const MuldRequest& request,
+                          const DownloadCallbacks& callbacks = {});
+
   void WaitAll();
   void Terminate();
 

@@ -36,8 +36,9 @@ class MuldDownloadManager {
   explicit MuldDownloadManager(const MuldConfig& config);
   ~MuldDownloadManager();
 
-  DownloaderResp Load(const std::string& path);
-  DownloaderResp Download(const MuldRequest& request);
+  DownloaderResp Load(const std::string& path, const DownloadCallbacks& callbacks = {});
+  DownloaderResp Download(const MuldRequest& request, const DownloadCallbacks& callbacks = {});
+
   void WaitAll();
   void Terminate();
 
