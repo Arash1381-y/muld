@@ -5,27 +5,30 @@
 
 namespace muld {
 
+// LogicalChunk: Stable identity for a chunk that never gets renumbered.
+// The chunk_id is fixed for the lifetime of the download job.
+// This is what the GUI sees and tracks.
 class ChunkInfo {
  public:
-  std::size_t index;
+  std::size_t chunk_id;  // Stable identifier, never changes
   std::size_t startRange_;
   std::size_t endRange_;
 
  public:
-  ChunkInfo() : index(0), startRange_(0), endRange_(0), received_(0) {}
+  ChunkInfo() : chunk_id(0), startRange_(0), endRange_(0), received_(0) {}
 
   ChunkInfo(const ChunkInfo&) = delete;
   ChunkInfo& operator=(const ChunkInfo&) = delete;
 
   ChunkInfo(ChunkInfo&& other) noexcept
-      : index(other.index),
+      : chunk_id(other.chunk_id),
         startRange_(other.startRange_),
         endRange_(other.endRange_),
         received_(other.received_.load(std::memory_order_relaxed)) {}
 
   ChunkInfo& operator=(ChunkInfo&& other) noexcept {
     if (this != &other) {
-      index = other.index;
+      chunk_id = other.chunk_id;
       startRange_ = other.startRange_;
       endRange_ = other.endRange_;
       received_.store(other.received_.load(std::memory_order_relaxed),
@@ -40,6 +43,10 @@ class ChunkInfo {
   std::size_t GetReceivedSize() const {
     return received_.load(std::memory_order_relaxed);
   }
+  
+  std::size_t GetRemainingSize() const {
+    return GetTotalSize() - GetReceivedSize();
+  }
 
   float GetProgressPercentage() const {
     auto total = GetTotalSize();
@@ -49,6 +56,10 @@ class ChunkInfo {
 
   void UpdateReceived(std::size_t amount) {
     received_.fetch_add(amount, std::memory_order_relaxed);
+  }
+  
+  void SetReceived(std::size_t amount) {
+    received_.store(amount, std::memory_order_relaxed);
   }
 
   bool IsFinished() const { return GetReceivedSize() >= GetTotalSize(); }

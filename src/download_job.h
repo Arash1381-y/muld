@@ -6,6 +6,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -34,11 +35,28 @@ struct DownloadProgress {
   float percentage;
 };
 
+struct ChunkProgressEvent {
+  std::size_t chunk_id;
+  std::size_t downloaded_bytes;
+  std::size_t total_bytes;
+  bool finished;
+};
+
 struct DownloadCallbacks {
   std::function<void(const DownloadProgress&)> on_progress;
+  std::function<void(const ChunkProgressEvent&)> on_chunk_progress;
   std::function<void(DownloadState)> on_state_change;
   std::function<void()> on_finish;
   std::function<void(MuldError)> on_error;
+};
+
+// WorkItem: ephemeral scheduling unit, rebuilt on Start/Resume.
+// Workers consume these instead of chunk indices.
+struct WorkItem {
+  std::size_t work_id;
+  std::size_t chunk_id;     // index into chunks_ vector (stable back-reference)
+  std::size_t range_start;  // file offset to start downloading from
+  std::size_t range_end;    // file offset end (inclusive)
 };
 
 class DownloadJob {
@@ -72,7 +90,7 @@ class DownloadJob {
 
   void NotifyConnectionOpen();
   void NotifyConnectionClose();
-  void NotifyChunkReceived(size_t index, size_t bytes);
+  void NotifyChunkReceived(size_t chunk_id, size_t bytes);
 
   // used for redirection
   void SetUrl(const Url& url);
@@ -88,7 +106,7 @@ class DownloadJob {
   size_t GetNumChunks() const;
   DownloadState GetState() const;
 
-  ssize_t GetNextChunkIndex();
+  WorkItem* GetNextWorkItem();
   ChunkInfo& GetChunkInfo(size_t index);
 
   Writer& GetWriter();
@@ -105,7 +123,7 @@ class DownloadJob {
   bool SetState(DownloadState state);
 
   bool NeedsStore() const;
-  size_t CleanUpChunks(std::vector<ChunkInfo>& chunks);
+  void BuildPendingWork();
 
   std::atomic<DownloadState> state_;
   bool ranged_;
@@ -127,18 +145,22 @@ class DownloadJob {
   size_t nChunks_;
   size_t
       nReceivedBytesFromLastStore_;  // number of bytes received from last store
-  std::atomic<size_t> lastRequestedChunk_;
   std::atomic<size_t> nDownloadedChunks_;
   std::vector<ChunkInfo> chunksInfo_;
 
+  // Work items: ephemeral scheduling units rebuilt on each Start/Resume
+  std::vector<WorkItem> pendingWork_;
+  std::atomic<size_t> nextWorkItem_;
+
   std::chrono::steady_clock::time_point lastSpeedCalcTime_;
+  std::chrono::steady_clock::time_point lastProgressCallbackTime_;
   std::atomic<size_t> nBytesFromLastSpeedCalc_;  // periodic num bytes counter
                                                  // for calculating speed
   std::atomic<double> downloadSpeed_;            // (bytes / per sec)
   std::atomic<double> eta_;                      // download job eta
 
   std::atomic<int> nConnections_;  // active connections (threads)
-  std::mutex wait_mtx_, error_mtx_, disk_mtx_, speed_mtx_;
+  std::mutex wait_mtx_, error_mtx_, disk_mtx_, speed_mtx_, callbacks_mtx_;
   std::condition_variable wait_cv_;
 
   std::function<void(DownloadJob*)> start_download_;

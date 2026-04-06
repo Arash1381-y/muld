@@ -62,10 +62,18 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # --- CLI Application ---
-add_executable(muld_cli src/muld_cli.cpp)
+add_executable(muld_cli src/muld_cli_async.cpp)
 set_target_properties(muld_cli PROPERTIES OUTPUT_NAME muld)
 target_include_directories(muld_cli PRIVATE include)
 target_link_libraries(muld_cli PRIVATE muld)
+
+# --- CLI Application POLLING ---
+# add_executable(muld_cli src/muld_cli_polling.cpp)
+# set_target_properties(muld_cli PROPERTIES OUTPUT_NAME muld_cli)
+# target_include_directories(muld_cli PRIVATE include)
+# target_link_libraries(muld_cli PRIVATE muld)
+
+
 
 # --- Tests ---
 enable_testing()

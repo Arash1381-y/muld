@@ -125,8 +125,16 @@ struct DownloadProgress {
   float percentage;
 };
 
+struct ChunkProgressEvent {
+  std::size_t chunk_id;
+  std::size_t downloaded_bytes;
+  std::size_t total_bytes;
+  bool finished;
+};
+
 struct DownloadCallbacks {
   std::function<void(const DownloadProgress&)> on_progress;
+  std::function<void(const ChunkProgressEvent&)> on_chunk_progress;
   std::function<void(DownloadState)> on_state_change;
   std::function<void()> on_finish;
   std::function<void(MuldError)> on_error;

@@ -35,9 +35,10 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
       nTotalReceivedBytes_(0),
       nChunks_(n_chunks),
       nReceivedBytesFromLastStore_(0),
-      lastRequestedChunk_(0),
+      nextWorkItem_(0),
       nDownloadedChunks_(0),
       lastSpeedCalcTime_(std::chrono::steady_clock::now()),
+      lastProgressCallbackTime_(std::chrono::steady_clock::now()),
       nBytesFromLastSpeedCalc_(0),
       downloadSpeed_(0),  // (bytes / per sec)
       eta_(0),            // download job eta
@@ -55,7 +56,7 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
       static_cast<size_t>((fileSize_ + nChunks_ - 1) / nChunks_);
   for (size_t i = 0; i < nChunks_; i++) {
     auto& chunk = chunksInfo_.at(i);
-    chunk.index = i;
+    chunk.chunk_id = i;
     chunk.startRange_ = i * chunk_size_org;
 
     if (i == nChunks_ - 1) {
@@ -70,10 +71,12 @@ DownloadJob::DownloadJob(const JobImage& image,
                          std::function<void(DownloadJob*)> start_download,
                          const DownloadCallbacks& callbacks)
     : lastSpeedCalcTime_(std::chrono::steady_clock::now()),
+      lastProgressCallbackTime_(std::chrono::steady_clock::now()),
       nBytesFromLastSpeedCalc_(0),
       downloadSpeed_(0),  // (bytes / per sec)
       eta_(0),            // download job eta
       nConnections_(0),
+      nextWorkItem_(0),
       callbacks_(callbacks) {
   state_ = DownloadState::Initialized;
   url_ = ParseUrl(image.url);
@@ -90,23 +93,24 @@ DownloadJob::DownloadJob(const JobImage& image,
   imageStored_ = true;
 
   chunksInfo_.resize(image.chunks.size());
-  size_t i = 0;
   size_t already_downloaded = 0;
-  for (const auto& c : image.chunks) {
-    auto& chunk = chunksInfo_.at(i);
-    chunk.index = i;
+  nChunks_ = image.chunks.size();
+  for (size_t i = 0; i < nChunks_; i++) {
+    const auto& c = image.chunks[i];
+    auto& chunk = chunksInfo_[i];
+    chunk.chunk_id = i;
     chunk.startRange_ = c.start_range;
     chunk.endRange_ = c.end_range;
     chunk.UpdateReceived(c.downloaded);
     already_downloaded += c.downloaded;
-
-    i++;
   }
 
-  size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
-  nChunks_ = chunksInfo_.size();
-  lastRequestedChunk_ = first_unfinished_index;
-  nDownloadedChunks_ = first_unfinished_index;
+  // Count already-finished chunks
+  size_t finished = 0;
+  for (size_t i = 0; i < nChunks_; i++) {
+    if (chunksInfo_[i].IsFinished()) finished++;
+  }
+  nDownloadedChunks_ = finished;
   nTotalReceivedBytes_ = already_downloaded;
   nReceivedBytesFromLastStore_ = already_downloaded;
 }
@@ -118,6 +122,7 @@ void DownloadJob::SetValidators(const std::string& etag,
 }
 
 void DownloadJob::AttachCallbacks(const DownloadCallbacks& callbacks) {
+  std::lock_guard<std::mutex> lock(callbacks_mtx_);
   callbacks_ = callbacks;
 }
 
@@ -136,11 +141,10 @@ std::string DownloadJob::GetIdentityKey() const {
   return outputPath_ + "\n" + GetUrlString(url_);
 }
 
-ssize_t DownloadJob::GetNextChunkIndex() {
-  size_t index = lastRequestedChunk_.fetch_add(1);
-  if (index >= nChunks_) return -1;
-
-  return index;
+WorkItem* DownloadJob::GetNextWorkItem() {
+  size_t idx = nextWorkItem_.fetch_add(1);
+  if (idx >= pendingWork_.size()) return nullptr;
+  return &pendingWork_[idx];
 }
 
 ChunkInfo& DownloadJob::GetChunkInfo(size_t index) {
@@ -168,13 +172,15 @@ size_t DownloadJob::GetDownloadSpeed() const { return downloadSpeed_.load(); };
 
 size_t DownloadJob::GetJobEta() const { return eta_.load(); };
 
-void DownloadJob::NotifyChunkReceived(size_t index, size_t bytes) {
-  auto& chunk = chunksInfo_.at(index);
+void DownloadJob::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
+  auto& chunk = chunksInfo_.at(chunk_id);
   chunk.UpdateReceived(bytes);
 
   // check the timer and update the speed if needed
   nBytesFromLastSpeedCalc_.fetch_add(bytes);
   nTotalReceivedBytes_.fetch_add(bytes);
+
+  bool should_fire_progress = false;
   auto now = std::chrono::steady_clock::now();
   double dt = std::chrono::duration<double>(now - lastSpeedCalcTime_).count();
   if (dt > 0.5) {
@@ -184,21 +190,50 @@ void DownloadJob::NotifyChunkReceived(size_t index, size_t bytes) {
     if (dt > 0.5) {
       // compute speed and eta
       downloadSpeed_.store(nBytesFromLastSpeedCalc_ / dt);
-      eta_.store((fileSize_ - nTotalReceivedBytes_) / downloadSpeed_);
+      double speed = downloadSpeed_.load();
+      if (speed > 0) {
+        eta_.store((fileSize_ - nTotalReceivedBytes_) / speed);
+      }
 
       // reset states
       nBytesFromLastSpeedCalc_ = 0;
       lastSpeedCalcTime_ = now;
+      should_fire_progress = true;
     }
+  }
 
-    // TODO: maybe we could notify all locks after updating speed and eta?
+  // Fire on_chunk_progress (lightweight, every call)
+  {
+    std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+    if (callbacks_.on_chunk_progress) {
+      ChunkProgressEvent evt;
+      evt.chunk_id = chunk_id;
+      evt.downloaded_bytes = chunk.GetReceivedSize();
+      evt.total_bytes = chunk.GetTotalSize();
+      evt.finished = chunk.IsFinished();
+      callbacks_.on_chunk_progress(evt);
+    }
+  }
+
+  // Fire throttled on_progress (~500ms)
+  if (should_fire_progress) {
+    std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+    if (callbacks_.on_progress) {
+      DownloadProgress dp;
+      dp.total_bytes = fileSize_;
+      dp.downloaded_bytes = nTotalReceivedBytes_.load();
+      dp.speed_bytes_per_sec = static_cast<size_t>(downloadSpeed_.load());
+      dp.eta_seconds = static_cast<size_t>(eta_.load());
+      dp.percentage = fileSize_ > 0
+          ? static_cast<float>(dp.downloaded_bytes) / static_cast<float>(fileSize_) * 100.0f
+          : 0.0f;
+      callbacks_.on_progress(dp);
+    }
   }
 
   {
     std::lock_guard<std::mutex> disk_lock(disk_mtx_);
-    // update number of unwritten bytes to image
     nReceivedBytesFromLastStore_ += bytes;
-
     if (NeedsStore()) {
       Store();
     }
@@ -207,18 +242,34 @@ void DownloadJob::NotifyChunkReceived(size_t index, size_t bytes) {
   if (chunk.IsFinished()) {
     if (nDownloadedChunks_.fetch_add(1, std::memory_order_acq_rel) ==
         nChunks_ - 1) {
-      // we only notify the wait if the previous state is downloading (yes we
-      // may notify a chunk but have a different state)
+      // All chunks done
       auto expected = DownloadState::Downloading;
       if (state_.compare_exchange_strong(expected, DownloadState::Completed)) {
+        {
+          std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+          Store();
+        }
+        {
+          std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+          if (callbacks_.on_finish) {
+            callbacks_.on_finish();
+          }
+        }
         std::lock_guard<std::mutex> wait_lock(wait_mtx_);
         wait_cv_.notify_all();
       } else if (expected == DownloadState::Paused ||
                  expected == DownloadState::Failed) {
-        // Edge case: User paused or a network error occurred on another
-        // thread exactly as the final byte was written. Override it to
-        // Completed!
         state_.store(DownloadState::Completed);
+        {
+          std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+          Store();
+        }
+        {
+          std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+          if (callbacks_.on_finish) {
+            callbacks_.on_finish();
+          }
+        }
         std::lock_guard<std::mutex> wait_lock(wait_mtx_);
         wait_cv_.notify_all();
       }
@@ -238,6 +289,28 @@ void DownloadJob::WaitUntilFinished() {
   std::unique_lock<std::mutex> lock(wait_mtx_);
   wait_cv_.wait(lock, [this]() { return IsFinished(); });
 }
+
+void DownloadJob::BuildPendingWork() {
+  pendingWork_.clear();
+  size_t work_id = 0;
+  size_t finished_count = 0;
+  for (size_t i = 0; i < nChunks_; i++) {
+    auto& chunk = chunksInfo_[i];
+    if (chunk.IsFinished()) {
+      finished_count++;
+      continue;
+    }
+    WorkItem wi;
+    wi.work_id = work_id++;
+    wi.chunk_id = i;
+    wi.range_start = chunk.startRange_ + chunk.GetReceivedSize();
+    wi.range_end = chunk.endRange_;
+    pendingWork_.push_back(wi);
+  }
+  nextWorkItem_ = 0;
+  nDownloadedChunks_ = finished_count;
+}
+
 bool DownloadJob::Start() {
   if (!SetState(DownloadState::Downloading)) return false;
 
@@ -246,11 +319,14 @@ bool DownloadJob::Start() {
     std::this_thread::yield();
   }
 
-  // clean up chunks and reset counts
-  size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
-  nChunks_ = chunksInfo_.size();
-  lastRequestedChunk_ = first_unfinished_index;
-  nDownloadedChunks_ = first_unfinished_index;
+  BuildPendingWork();
+
+  // Reset speed tracking
+  lastSpeedCalcTime_ = std::chrono::steady_clock::now();
+  lastProgressCallbackTime_ = std::chrono::steady_clock::now();
+  nBytesFromLastSpeedCalc_ = 0;
+  downloadSpeed_ = 0;
+  eta_ = 0;
 
   start_download_(this);
 
@@ -265,11 +341,14 @@ bool DownloadJob::Resume() {
     std::this_thread::yield();
   }
 
-  // clean up chunks and reset counts
-  size_t first_unfinished_index = CleanUpChunks(chunksInfo_);
-  nChunks_ = chunksInfo_.size();
-  lastRequestedChunk_ = first_unfinished_index;
-  nDownloadedChunks_ = first_unfinished_index;
+  BuildPendingWork();
+
+  // Reset speed tracking
+  lastSpeedCalcTime_ = std::chrono::steady_clock::now();
+  lastProgressCallbackTime_ = std::chrono::steady_clock::now();
+  nBytesFromLastSpeedCalc_ = 0;
+  downloadSpeed_ = 0;
+  eta_ = 0;
 
   start_download_(this);
 
@@ -309,9 +388,6 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
   }
 
   {
-    // set error
-    // Note: Yes, an error_mtx_ is a good idea if GUI threads 
-    // might read GetError() at the exact moment this writes.
     std::lock_guard<std::mutex> error_lock(error_mtx_);
     error_.code = code;
     error_.detail = detail;
@@ -323,8 +399,11 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
     wait_cv_.notify_all();
   }
 
-  if (callbacks_.on_error) {
-    callbacks_.on_error(error_);
+  {
+    std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+    if (callbacks_.on_error) {
+      callbacks_.on_error(error_);
+    }
   }
 }
 
@@ -363,7 +442,7 @@ bool DownloadJob::SetState(DownloadState next_state) {
     while (current == DownloadState::Downloading) {
       if (state_.compare_exchange_strong(current, DownloadState::Failed)) {
         state_changed = true;
-        break;  // Ensure we break out of the loop on success!
+        break;
       }
     }
   } else {
@@ -372,8 +451,8 @@ bool DownloadJob::SetState(DownloadState next_state) {
     state_changed = true;
   }
 
-  // TRIGGER CALLBACK ONLY IF SUCCESSFUL
   if (state_changed) {
+    std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
     if (callbacks_.on_state_change) {
       callbacks_.on_state_change(next_state);
     }
@@ -386,11 +465,6 @@ bool DownloadJob::SetState(DownloadState next_state) {
 DownloadState DownloadJob::GetState() const { return state_.load(); }
 
 void DownloadJob::Store() {
-  // this function is called mainly for 2 reasons:
-  // 1) periodic disk update.
-  // 2) special events such as failed downloads (the user may like to retry
-  // downloading  after the issue is resolved)
-
   auto chunks = std::vector<ChunkState>();
   for (const auto& c : chunksInfo_) {
     chunks.emplace_back(ChunkState{.start_range = c.startRange_,
@@ -398,7 +472,6 @@ void DownloadJob::Store() {
                                    .downloaded = c.GetReceivedSize()});
   }
 
-  // create a job image and write it to disk
   JobImage img = {.file_path = writer_->filePath_,
                   .file_size = fileSize_,
                   .max_connections = maxConnections_,
@@ -418,50 +491,10 @@ void DownloadJob::Store() {
   }
   updatedAt_ = img.updated_at;
 
-  // reset bytes read
   nReceivedBytesFromLastStore_ = 0;
 }
 
-size_t DownloadJob::CleanUpChunks(std::vector<ChunkInfo>& chunks) {
-  size_t originalSize = chunks.size();
-
-  for (size_t i = 0; i < originalSize; ++i) {
-    size_t receivedSoFar = chunks[i].GetReceivedSize();
-
-    if (!chunks[i].IsFinished() && receivedSoFar > 0) {
-      // create the finished sub-chunk
-      ChunkInfo finishedPart;
-      finishedPart.index = chunks[i].index;
-      finishedPart.startRange_ = chunks[i].startRange_;
-      finishedPart.endRange_ = chunks[i].startRange_ + receivedSoFar - 1;
-      finishedPart.UpdateReceived(receivedSoFar);
-
-      // create the remaining unfinished sub-chunk
-      ChunkInfo unfinishedPart;
-      unfinishedPart.index = chunks[i].index;
-      unfinishedPart.startRange_ = chunks[i].startRange_ + receivedSoFar;
-      unfinishedPart.endRange_ = chunks[i].endRange_;
-
-      // modify the existing vector directly
-      chunks[i] = std::move(unfinishedPart);
-      chunks.push_back(std::move(finishedPart));
-    }
-  }
-
-  auto unfinished_begin = std::stable_partition(
-      chunks.begin(), chunks.end(),
-      [](const ChunkInfo& chunk) { return chunk.IsFinished(); });
-
-  for (size_t i = 0; i < chunks.size(); ++i) {
-    chunks[i].index = i;
-  }
-
-  // just return the index
-  return std::distance(chunks.begin(), unfinished_begin);
-}
-
 bool DownloadJob::NeedsStore() const {
-  // TODO: maybe we can use this function for special events
   return nReceivedBytesFromLastStore_ >= 10 * 1024 * 1024;  // 10 MB
 }
 

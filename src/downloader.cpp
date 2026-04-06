@@ -53,16 +53,16 @@ struct DiskException : public std::runtime_error {
 };
 
 http::request<http::empty_body> BuildRequest(const Url& url,
-                                             const ChunkInfo& chunk,
-                                             std::size_t current_offset,
+                                             std::size_t range_start,
+                                             std::size_t range_end,
                                              bool isRanged) {
   http::request<http::empty_body> req{http::verb::get, url.path, 11};
   req.set(http::field::host, url.host);
   req.set(http::field::user_agent, "muld/0.1");
   if (isRanged) {
     // Request from our current progress point up to the chunk end
-    std::string range_val = "bytes=" + std::to_string(current_offset) + "-" +
-                            std::to_string(chunk.endRange_);
+    std::string range_val = "bytes=" + std::to_string(range_start) + "-" +
+                            std::to_string(range_end);
     req.set(http::field::range, range_val);
     req.keep_alive(true);
   }
@@ -118,7 +118,7 @@ void ValidateResponse(const http::response_parser<http::buffer_body>& parser,
 template <StreamType T>
 bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
                       http::response_parser<http::buffer_body>& parser,
-                      DownloadJob* job, const ChunkInfo& chunk,
+                      DownloadJob* job, std::size_t chunk_id,
                       std::size_t& current_offset) {
   constexpr std::size_t BUFFER_SIZE = 32768;
   char body_buffer[BUFFER_SIZE];
@@ -151,7 +151,7 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
         current_offset += static_cast<size_t>(bw);
       }
 
-      job->NotifyChunkReceived(chunk.index, bytes_read);
+      job->NotifyChunkReceived(chunk_id, bytes_read);
     }
 
     if (ec) {
@@ -262,19 +262,17 @@ void DownloadWorkerImpl(const Task& task,
       }
     };
 
-    ssize_t index;
     beast::flat_buffer buffer;
     buffer.reserve(8192);
 
     bool is_connected = false;
 
-    while ((index = job->GetNextChunkIndex()) != -1) {
-      auto& chunk = job->GetChunkInfo(index);
+    WorkItem* work_item;
+    while ((work_item = job->GetNextWorkItem()) != nullptr) {
 
-      std::size_t current_offset = chunk.startRange_;
+      std::size_t current_offset = work_item->range_start;
       bool chunk_finished = false;
 
-      // TODO: seems we do not give up on a request. is this the correct way?
       // Keep downloading until this chunk is perfectly finished
       while (!chunk_finished) {
         if (job->GetState() != DownloadState::Downloading) {
@@ -286,7 +284,8 @@ void DownloadWorkerImpl(const Task& task,
           is_connected = true;
         }
 
-        auto req = BuildRequest(url, chunk, current_offset, job->IsRanged());
+        auto req = BuildRequest(url, current_offset, work_item->range_end,
+                                job->IsRanged());
         http::write(*stream, req);
 
         http::response_parser<http::buffer_body> parser;
@@ -295,8 +294,8 @@ void DownloadWorkerImpl(const Task& task,
         http::read_header(*stream, buffer, parser);
         ValidateResponse(parser, job->IsRanged());
 
-        // StreamBodyToDisk tracks current_offset internally
-        chunk_finished = StreamBodyToDisk(*stream, buffer, parser, job, chunk,
+        chunk_finished = StreamBodyToDisk(*stream, buffer, parser, job,
+                                          work_item->chunk_id,
                                           current_offset);
 
         // If interrupted before finished, or server requested close
