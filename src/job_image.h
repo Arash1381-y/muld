@@ -52,14 +52,19 @@ inline bool WriteImageToDisk(const JobImage& img, const std::string& path,
 
   const std::uint32_t version = JobImage::kVersion;
   out.write(reinterpret_cast<const char*>(&version), sizeof(version));
-  out.write(reinterpret_cast<const char*>(&img.file_size), sizeof(img.file_size));
+  out.write(reinterpret_cast<const char*>(&img.file_size),
+            sizeof(img.file_size));
   out.write(reinterpret_cast<const char*>(&img.max_connections),
             sizeof(img.max_connections));
   out.write(reinterpret_cast<const char*>(&img.ranged), sizeof(img.ranged));
-  out.write(reinterpret_cast<const char*>(&img.created_at), sizeof(img.created_at));
-  out.write(reinterpret_cast<const char*>(&img.updated_at), sizeof(img.updated_at));
+  out.write(reinterpret_cast<const char*>(&img.created_at),
+            sizeof(img.created_at));
+  if (index) index->updated_at_offset = out.tellp();
+  out.write(reinterpret_cast<const char*>(&img.updated_at),
+            sizeof(img.updated_at));
 
-  WriteStringField(out, img.file_path, index ? &index->file_path_offset : nullptr);
+  WriteStringField(out, img.file_path,
+                   index ? &index->file_path_offset : nullptr);
   WriteStringField(out, img.url, index ? &index->url_offset : nullptr);
   WriteStringField(out, img.etag, index ? &index->etag_offset : nullptr);
   WriteStringField(out, img.last_modified,
@@ -105,6 +110,7 @@ inline bool ReadImageFromDisk(JobImage& img, const std::string& path,
             sizeof(img.max_connections));
     in.read(reinterpret_cast<char*>(&img.ranged), sizeof(img.ranged));
     in.read(reinterpret_cast<char*>(&img.created_at), sizeof(img.created_at));
+    if (index) index->updated_at_offset = in.tellg();
     in.read(reinterpret_cast<char*>(&img.updated_at), sizeof(img.updated_at));
     if (!in.good()) return false;
 

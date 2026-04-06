@@ -4,11 +4,15 @@
 namespace muld {
 
 enum class ErrorCode {
-  Success = 0,
-  HTTP_ERR,
-  DISK_ERR,
-  NETWORK_ERR,
-  SYSTEM_ERR,
+  Ok = 0,
+  NotInitialized,
+  InvalidState,
+  InvalidRequest,
+  HttpError,
+  DiskError,
+  NetworkError,
+  SystemError,
+  DuplicateJob,
   FetchFileInfoFailed,
   ConnectionRefused,
   DiskWriteFailed,
@@ -18,30 +22,60 @@ enum class ErrorCode {
 
 constexpr const char* GetErrorPrefix(ErrorCode code) {
   switch (code) {
-    case ErrorCode::Success:
-      return "Success";
+    case ErrorCode::Ok:
+      return "Ok";
+
+    case ErrorCode::NotInitialized:
+      return "Component not initialized";
+
+    case ErrorCode::InvalidState:
+      return "Invalid state";
+
+    case ErrorCode::InvalidRequest:
+      return "Invalid request";
+
+    case ErrorCode::HttpError:
+      return "HTTP error";
+
+    case ErrorCode::DiskError:
+      return "Disk error";
+
+    case ErrorCode::NetworkError:
+      return "Network error";
+
+    case ErrorCode::SystemError:
+      return "System error";
+
+    case ErrorCode::DuplicateJob:
+      return "Duplicate job";
+
     case ErrorCode::FetchFileInfoFailed:
       return "Cannot fetch file head";
+
     case ErrorCode::ConnectionRefused:
       return "Connection refused";
+
     case ErrorCode::DiskWriteFailed:
       return "Cannot write to destination disk";
+
     case ErrorCode::MaxRedirectsExceeded:
       return "Exceeded maximum HTTP redirects";
+
     case ErrorCode::NotSupported:
-      return "Not Supported Request";
+      return "Not supported request";
+
     default:
       return "Unknown error";
   }
 }
 
 struct MuldError {
-  ErrorCode code = ErrorCode::Success;
+  ErrorCode code = ErrorCode::Ok;
   int http_status = 0;
   std::string detail;
 
   std::string GetFormattedMessage() const {
-    if (code == ErrorCode::Success) {
+    if (code == ErrorCode::Ok) {
       return "No error";
     }
     if (detail.empty()) {
@@ -51,7 +85,7 @@ struct MuldError {
   }
 
   // Helper to check if an error exists
-  explicit operator bool() const { return code != ErrorCode::Success; }
+  explicit operator bool() const { return code != ErrorCode::Ok; }
 };
 
 }  // namespace muld

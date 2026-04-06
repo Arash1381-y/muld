@@ -192,7 +192,11 @@ int main(int argc, char* argv[]) {
   std::cout << "Dest: " << output_path << "\n";
   std::cout << "Conn: " << connections << "\n\n";
 
-  auto handler = manager.Download(request);
+  auto [err, handler] = manager.Download(request);
+  if (err) {
+    cli_logger(LogLevel::Error, err.detail);
+    exit(EXIT_FAILURE);
+  }
 
   std::size_t last_bytes = 0;
   double smoothed_speed = 0.0;
@@ -201,12 +205,12 @@ int main(int argc, char* argv[]) {
   auto start = std::chrono::steady_clock::now();
   auto last_tick = start;
 
-  while (!handler.IsFinished()) {
+  while (!handler->IsFinished()) {
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - last_tick).count();
 
-    auto total = handler.GetProgress();
-    auto chunks = handler.GetChunksProgress();
+    auto total = handler->GetProgress();
+    auto chunks = handler->GetChunksProgress();
 
     std::size_t total_chunk_downloaded = 0;
     std::size_t total_chunk_size = 0;
@@ -257,7 +261,6 @@ int main(int argc, char* argv[]) {
     std::string active_str =
         std::to_string(active_chunks_info.size()) + " Active Chunks: ";
 
-
     for (const auto& ac : active_chunks_info) active_str += ac + " ";
     if (active_str.length() > 80)
       active_str = active_str.substr(0, 77) +
@@ -280,8 +283,7 @@ int main(int argc, char* argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
 
-  const auto& err = handler.GetError();
-  if (err.code != ErrorCode::Success) {
+  if (handler->HasError()) {
     std::cout << "\n\033[31mDOWNLOAD FAILED:\033[0m " << err.detail
               << std::endl;
     return 1;
@@ -289,7 +291,7 @@ int main(int argc, char* argv[]) {
 
   auto end = std::chrono::steady_clock::now();
   double total_time = std::chrono::duration<double>(end - start).count();
-  auto final_total = handler.GetProgress();
+  auto final_total = handler->GetProgress();
 
   std::cout << "\033[2F\033[2K";
   std::cout << "\r100% [" << std::string(40, '=') << "] " << std::setw(9)

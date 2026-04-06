@@ -74,8 +74,13 @@ add_executable(muld_test_pause_resume tests/test_pause_resume.cpp)
 target_link_libraries(muld_test_pause_resume PRIVATE muld)
 target_include_directories(muld_test_pause_resume PRIVATE include)
 
+add_executable(muld_test_terminate_load tests/test_terminate_load.cpp)
+target_link_libraries(muld_test_terminate_load PRIVATE muld)
+target_include_directories(muld_test_terminate_load PRIVATE include)
+
 # Register it with CTest
 add_test(NAME PauseResumeTest COMMAND muld_test_pause_resume)
+add_test(NAME TerminateLoadTest COMMAND muld_test_terminate_load)
 
 # Install the library, executable, and export the targets
 install(TARGETS muld_cli

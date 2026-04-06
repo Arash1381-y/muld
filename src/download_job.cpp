@@ -23,18 +23,43 @@ std::uint64_t GetUnixTimestamp() {
 }  // namespace
 
 DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
-                         int max_connections)
-    : url_(url),
+                         int max_connections, size_t file_size, bool ranged,
+                         size_t n_chunks,
+                         std::function<void(DownloadJob*)> start_download)
+    : maxConnections_(max_connections),
+      ranged_(ranged),
+      url_(url),
       outputPath_(output_path),
-      maxConnections_(max_connections),
+      fileSize_(file_size),
+      nChunks_(n_chunks),
       nReceivedBytes_(0),
       lastRequestedChunk_(0),
       nDownloadedChunks_(0),
-      nConnections_(0) {
+      nConnections_(0),
+      start_download_(start_download) {
   createdAt_ = GetUnixTimestamp();
   updatedAt_ = createdAt_;
   state_ = DownloadState::Uninitialized;
-};
+  maxConnections_ = ranged_ ? maxConnections_ : 1;
+  writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
+  chunksInfo_.resize(nChunks_);
+
+  size_t chunk_size_org =
+      static_cast<size_t>((fileSize_ + nChunks_ - 1) / nChunks_);
+  for (size_t i = 0; i < nChunks_; i++) {
+    auto& chunk = chunksInfo_.at(i);
+    chunk.index = i;
+    chunk.startRange_ = i * chunk_size_org;
+
+    if (i == nChunks_ - 1) {
+      chunk.endRange_ = fileSize_ - 1;
+    } else {
+      chunk.endRange_ = chunk.startRange_ + chunk_size_org - 1;
+    }
+  }
+
+  this->SetState(DownloadState::Initialized);
+}
 
 DownloadJob::DownloadJob(const JobImage& image,
                          std::function<void(DownloadJob*)> start_download)
@@ -43,7 +68,6 @@ DownloadJob::DownloadJob(const JobImage& image,
                                // should make sure its valid
   outputPath_ = image.file_path;
 
-  is_initialized_ = true;
   state_ = DownloadState::Initialized;
 
   fileSize_ = image.file_size;
@@ -78,39 +102,11 @@ DownloadJob::DownloadJob(const JobImage& image,
   nReceivedBytes_ = already_downloaded;
 }
 
-void DownloadJob::Init(size_t file_size, bool ranged, size_t n_chunks,
-                       std::function<void(DownloadJob*)> start_download) {
-  is_initialized_ = true;
-  fileSize_ = file_size;
-  ranged_ = ranged;
-  maxConnections_ = ranged ? maxConnections_ : 1;
-  writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
-  nChunks_ = n_chunks;
-  chunksInfo_.resize(n_chunks);
-  start_download_ = start_download;
-  size_t chunk_size_org =
-      static_cast<size_t>((fileSize_ + nChunks_ - 1) / nChunks_);
-  for (size_t i = 0; i < nChunks_; i++) {
-    auto& chunk = chunksInfo_.at(i);
-    chunk.index = i;
-    chunk.startRange_ = i * chunk_size_org;
-
-    if (i == nChunks_ - 1) {
-      chunk.endRange_ = fileSize_ - 1;
-    } else {
-      chunk.endRange_ = chunk.startRange_ + chunk_size_org - 1;
-    }
-  }
-  this->SetState(DownloadState::Initialized);
-}
-
 void DownloadJob::SetValidators(const std::string& etag,
                                 const std::string& last_modified) {
   etag_ = etag;
   lastModified_ = last_modified;
 }
-
-bool DownloadJob::IsInitialized() const { return is_initialized_; }
 
 void DownloadJob::NotifyConnectionOpen() { nConnections_.fetch_add(1); }
 
@@ -286,10 +282,8 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
   while (current_state == DownloadState::Downloading ||
          current_state == DownloadState::Uninitialized) {
     if (state_.compare_exchange_strong(current_state, DownloadState::Failed)) {
-      if (is_initialized_) {
-        std::lock_guard<std::mutex> disk_lock(disk_mtx_);
-        this->Store();
-      }
+      std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+      this->Store();
 
       {
         std::lock_guard<std::mutex> error_lock(error_mtx_);

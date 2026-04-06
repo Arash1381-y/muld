@@ -33,10 +33,10 @@ int main(int argc, char* argv[]) {
 
   // 1. Start Download
   std::cout << "[Test] Initiating download...\n";
-  auto handler = manager.Download(request);
+  auto [err, handler] = manager.Download(request);
 
-  if (handler.GetError()) {
-    std::cerr << "Failed to start download. Check network or URL.\n";
+  if (err) {
+    std::cerr << err.detail << std::endl;
     return 1;
   }
 
@@ -46,7 +46,7 @@ int main(int argc, char* argv[]) {
 
   // 3. Trigger Pause
   std::cout << "[Test] Attempting to Pause...\n";
-  bool pause_success = handler.Pause();
+  bool pause_success = handler->Pause();
 
   if (!pause_success) {
     std::cerr << "[Test Failed] Pause() returned false!\n";
@@ -57,7 +57,7 @@ int main(int argc, char* argv[]) {
   // Wait a moment for worker threads to finish their current in-flight buffers
   std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 
-  auto progress_after_pause = handler.GetProgress();
+  auto progress_after_pause = handler->GetProgress();
   std::size_t bytes_at_pause = progress_after_pause.downloaded_bytes;
   std::cout << "[Test] Bytes at pause: " << bytes_at_pause << "\n";
 
@@ -65,7 +65,7 @@ int main(int argc, char* argv[]) {
       << "[Test] Waiting 3 seconds to ensure progress does not increase...\n";
   std::this_thread::sleep_for(std::chrono::seconds(3));
 
-  auto progress_during_pause = handler.GetProgress();
+  auto progress_during_pause = handler->GetProgress();
   std::size_t bytes_during_pause = progress_during_pause.downloaded_bytes;
   std::cout << "[Test] Bytes after waiting: " << bytes_during_pause << "\n";
 
@@ -79,7 +79,7 @@ int main(int argc, char* argv[]) {
 
   // 5. Trigger Resume
   std::cout << "[Test] Attempting to Resume...\n";
-  bool resume_success = handler.Resume();
+  bool resume_success = handler->Resume();
 
   if (!resume_success) {
     std::cerr << "[Test Failed] Resume() returned false!\n";
@@ -89,7 +89,7 @@ int main(int argc, char* argv[]) {
 
   // 6. Verify that downloading continues
   std::this_thread::sleep_for(std::chrono::seconds(2));
-  auto progress_after_resume = handler.GetProgress();
+  auto progress_after_resume = handler->GetProgress();
 
   if (progress_after_resume.downloaded_bytes <= bytes_during_pause) {
     std::cerr << "[Test Failed] Download did NOT resume! Progress is stuck.\n";
@@ -99,21 +99,21 @@ int main(int argc, char* argv[]) {
 
   // 7. Wait for Completion
   std::cout << "[Test] Waiting for download to finish...\n";
-  while (!handler.IsFinished()) {
-    auto progress = handler.GetProgress();
+  while (!handler->IsFinished()) {
+    auto progress = handler->GetProgress();
     std::cout << "[INFO] " << progress.downloaded_bytes << " / "
               << progress.total_bytes << " | " << progress.percentage << " %"
               << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(3));
   }
 
-  if (handler.HasError()) {
+  if (handler->HasError()) {
     std::cerr << "[Test Failed] Download finished with an error: "
-              << handler.GetError().detail << "\n";
+              << handler->GetError().detail << "\n";
     return 1;
   }
 
-  auto final_progress = handler.GetProgress();
+  auto final_progress = handler->GetProgress();
   if (final_progress.downloaded_bytes != final_progress.total_bytes) {
     std::cerr << "[Test Failed] Size mismatch! Downloaded: "
               << final_progress.downloaded_bytes << " / "

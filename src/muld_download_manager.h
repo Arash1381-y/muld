@@ -1,8 +1,9 @@
 #pragma once
+#include <optional>
 #include <queue>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <string>
 
 #include "download_handler.h"
 #include "task.h"
@@ -21,17 +22,24 @@ struct MuldRequest {
   int max_connections;
 };
 
+struct DownloaderResp {
+  MuldError error;
+  std::optional<DownloadHandler> handler;
+
+  bool ok() const { return error.code == ErrorCode::Ok; }
+  operator bool() const { return ok(); }
+};
+
 class MuldDownloadManager {
  public:
   // constructor
   explicit MuldDownloadManager(const MuldConfig& config);
   ~MuldDownloadManager();
 
-  DownloadHandler Download(const MuldRequest& request);
+  DownloaderResp Load(const std::string& path);
+  DownloaderResp Download(const MuldRequest& request);
   void WaitAll();
   void Terminate();
-
-  DownloadHandler Load(const std::string& path);
 
  private:
   void EnqueueTasks(DownloadJob* job, int connections);

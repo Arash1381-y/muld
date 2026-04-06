@@ -1,22 +1,30 @@
 #pragma once
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <memory>
-#include <string>
 
 namespace muld {
+
+///////////////////////////////////////
+//////////////// error ////////////////
+///////////////////////////////////////
 
 enum class LogLevel { Debug, Info, Warning, Error };
 using LogCallback = std::function<void(LogLevel, const std::string&)>;
 
 enum class ErrorCode {
-  Success = 0,
-  HTTP_ERR,
-  DISK_ERR,
-  NETWORK_ERR,
-  SYSTEM_ERR,
+  Ok = 0,
+  NotInitialized,
+  InvalidState,
+  InvalidRequest,
+  HttpError,
+  DiskError,
+  NetworkError,
+  SystemError,
+  DuplicateJob,
   FetchFileInfoFailed,
   ConnectionRefused,
   DiskWriteFailed,
@@ -26,30 +34,60 @@ enum class ErrorCode {
 
 constexpr const char* GetErrorPrefix(ErrorCode code) {
   switch (code) {
-    case ErrorCode::Success:
-      return "Success";
+    case ErrorCode::Ok:
+      return "Ok";
+
+    case ErrorCode::NotInitialized:
+      return "Component not initialized";
+
+    case ErrorCode::InvalidState:
+      return "Invalid state";
+
+    case ErrorCode::InvalidRequest:
+      return "Invalid request";
+
+    case ErrorCode::HttpError:
+      return "HTTP error";
+
+    case ErrorCode::DiskError:
+      return "Disk error";
+
+    case ErrorCode::NetworkError:
+      return "Network error";
+
+    case ErrorCode::SystemError:
+      return "System error";
+
+    case ErrorCode::DuplicateJob:
+      return "Duplicate job";
+
     case ErrorCode::FetchFileInfoFailed:
       return "Cannot fetch file head";
+
     case ErrorCode::ConnectionRefused:
       return "Connection refused";
+
     case ErrorCode::DiskWriteFailed:
       return "Cannot write to destination disk";
+
     case ErrorCode::MaxRedirectsExceeded:
       return "Exceeded maximum HTTP redirects";
+
     case ErrorCode::NotSupported:
-      return "Not Supported Request";
+      return "Not supported request";
+
     default:
       return "Unknown error";
   }
 }
 
 struct MuldError {
-  ErrorCode code = ErrorCode::Success;
+  ErrorCode code = ErrorCode::Ok;
   int http_status = 0;
   std::string detail;
 
   std::string GetFormattedMessage() const {
-    if (code == ErrorCode::Success) {
+    if (code == ErrorCode::Ok) {
       return "No error";
     }
     if (detail.empty()) {
@@ -59,12 +97,22 @@ struct MuldError {
   }
 
   // Helper to check if an error exists
-  explicit operator bool() const { return code != ErrorCode::Success; }
+  explicit operator bool() const { return code != ErrorCode::Ok; }
 };
+///////////////////////////////////////
+///////////////////////////////////////
+///////////////////////////////////////
 
 ///////////////////////////////////////
 ////////////// handler ////////////////
 ///////////////////////////////////////
+class DownloadJob;
+struct HandlerResp {
+  MuldError error;
+
+  bool ok() const { return error.code == ErrorCode::Ok; }
+  operator bool() const { return ok(); }
+};
 struct DownloadProgress {
   std::size_t total_bytes;
   std::size_t downloaded_bytes;
@@ -77,10 +125,9 @@ struct ChunkProgress {
   std::size_t total_bytes;
 };
 
-class DownloadJob;
 class DownloadHandler {
  public:
-  explicit DownloadHandler(DownloadJob* job);
+  explicit DownloadHandler(std::weak_ptr<DownloadJob> job);
 
   DownloadProgress GetProgress() const;
   std::vector<ChunkProgress> GetChunksProgress() const;
@@ -88,11 +135,11 @@ class DownloadHandler {
   bool HasError() const;
   const MuldError& GetError() const;
   void Wait() const;
-  bool Pause();
-  bool Resume();
+  HandlerResp Pause();
+  HandlerResp Resume();
 
  private:
-  DownloadJob* job_;
+  std::weak_ptr<DownloadJob> job_;
 };
 
 ///////////////////////////////////////
@@ -115,17 +162,24 @@ struct MuldRequest {
   int max_connections;
 };
 
+struct DownloaderResp {
+  MuldError error;
+  std::optional<DownloadHandler> handler;
+
+  bool ok() const { return error.code == ErrorCode::Ok; }
+  operator bool() const { return ok(); }
+};
+
 class MuldDownloadManager {
  public:
   // constructor
   explicit MuldDownloadManager(const MuldConfig& config);
   ~MuldDownloadManager();
 
-  DownloadHandler Download(const MuldRequest& request);
+  DownloaderResp Load(const std::string& path);
+  DownloaderResp Download(const MuldRequest& request);
   void WaitAll();
   void Terminate();
-
-  DownloadHandler Load(const std::string& path);
 
  private:
   void EnqueueTasks(DownloadJob* job, int connections);

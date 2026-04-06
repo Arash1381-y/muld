@@ -202,12 +202,12 @@ FetchResult FetchFileInfoImpl(T& stream, const Url& url) {
         result.data = FetchRedirect{res[http::field::location].to_string()};
       } else {
         result.state = FetchResult::State::FAILED;
-        result.data = FetchError{ErrorCode::HTTP_ERR, res.result_int(),
+        result.data = FetchError{ErrorCode::HttpError, res.result_int(),
                                  "Redirect response missing Location header"};
       }
     } else {
       result.state = FetchResult::State::FAILED;
-      result.data = FetchError{ErrorCode::HTTP_ERR, res.result_int(),
+      result.data = FetchError{ErrorCode::HttpError, res.result_int(),
                                "HTTP Error: " + std::string(res.reason())};
     }
 
@@ -220,12 +220,12 @@ FetchResult FetchFileInfoImpl(T& stream, const Url& url) {
   } catch (beast::system_error const& e) {
     result.state = FetchResult::State::FAILED;
     result.data =
-        FetchError{ErrorCode::NETWORK_ERR, 0,
+        FetchError{ErrorCode::NetworkError, 0,
                    std::string("Network failure during fetch: ") + e.what()};
   } catch (std::exception const& e) {
     result.state = FetchResult::State::FAILED;
     result.data =
-        FetchError{ErrorCode::SYSTEM_ERR, 0,
+        FetchError{ErrorCode::SystemError, 0,
                    std::string("System error during fetch: ") + e.what()};
   }
 
@@ -335,17 +335,17 @@ void DownloadWorkerImpl(const Task& task,
 
   } catch (HttpException const& e) {
     // http error
-    job->Fail(ErrorCode::HTTP_ERR, e.what(), e.status_code);
+    job->Fail(ErrorCode::HttpError, e.what(), e.status_code);
   } catch (DiskException const& e) {
     // disk write error
-    job->Fail(ErrorCode::DISK_ERR, e.what());
+    job->Fail(ErrorCode::DiskError, e.what());
   } catch (beast::system_error const& e) {
     // system error
-    job->Fail(ErrorCode::NETWORK_ERR,
+    job->Fail(ErrorCode::NetworkError,
               std::string("Network interrupted: ") + e.what());
   } catch (std::exception const& e) {
     // others
-    job->Fail(ErrorCode::SYSTEM_ERR,
+    job->Fail(ErrorCode::SystemError,
               std::string("Unexpected system error: ") + e.what());
   }
 }
@@ -390,12 +390,12 @@ FetchResult FetchFileInfo(const Url& url) {
   } catch (beast::system_error const& e) {
     FetchResult result;
     result.state = FetchResult::State::FAILED;
-    result.data = FetchError(ErrorCode::NETWORK_ERR, 0, e.what());
+    result.data = FetchError(ErrorCode::NetworkError, 0, e.what());
     return result;
   } catch (std::exception const& e) {
     FetchResult result;
     result.state = FetchResult::State::FAILED;
-    result.data = FetchError(ErrorCode::SYSTEM_ERR, 0, e.what());
+    result.data = FetchError(ErrorCode::SystemError, 0, e.what());
     return result;
   }
 }
@@ -429,11 +429,11 @@ void DownloadWorker(const Task& task) {
     }
   } catch (beast::system_error const& e) {
     // system error
-    job->Fail(ErrorCode::NETWORK_ERR,
+    job->Fail(ErrorCode::NetworkError,
               std::string("DNS Resolution/Setup failed: ") + e.what());
   } catch (std::exception const& e) {
     // network error
-    job->Fail(ErrorCode::SYSTEM_ERR,
+    job->Fail(ErrorCode::SystemError,
               std::string("Unexpected setup error: ") + e.what());
   }
 }

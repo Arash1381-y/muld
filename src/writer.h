@@ -6,7 +6,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <string>
-#include <system_error>
+
+#include "error.h"
 
 namespace muld {
 
@@ -18,13 +19,13 @@ class Writer {
     fd_ = open(file_path.c_str(), O_WRONLY | O_CREAT, 0644);
     if (fd_ == -1) {
       throw std::system_error(errno, std::generic_category(),
-                              "Failed to open file");
+                               "Failed to open file");
     }
 
     if (total_size > 0) {
       if (ftruncate(fd_, total_size) == -1) {
         throw std::system_error(errno, std::generic_category(),
-                                "Failed to open file");
+                                 "Failed to open file");
       }
     }
   }

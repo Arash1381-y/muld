@@ -1,8 +1,8 @@
 #pragma once
 
 #include <atomic>
-#include <cstdint>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -30,7 +30,10 @@ class DownloadJob {
   };
 
   DownloadJob(const Url& url, const std::string& output_path,
-              int max_connections);
+              int max_connections, size_t file_size, bool ranged,
+              size_t n_chunks,
+              std::function<void(DownloadJob*)> start_download);
+
   DownloadJob(const JobImage& image,
               std::function<void(DownloadJob*)> start_download);
 
@@ -40,9 +43,6 @@ class DownloadJob {
   DownloadJob& operator=(DownloadJob&&) = delete;
 
   ~DownloadJob() {}
-
-  void Init(size_t file_size, bool ranged, size_t n_chunks,
-            std::function<void(DownloadJob*)> start_download);
 
   void WaitUntilFinished();
   void Store();
@@ -68,7 +68,6 @@ class DownloadJob {
   Writer& GetWriter();
   const Writer& GetWriter() const;
 
-  bool IsInitialized() const;
   bool IsFinished() const;
   bool IsRanged() const;
   std::string GetIdentityKey() const;
@@ -81,7 +80,6 @@ class DownloadJob {
   size_t CleanUpChunks(std::vector<ChunkInfo>& chunks);
 
   std::atomic<DownloadState> state_ = DownloadState::Uninitialized;
-  bool is_initialized_ = false;
   bool ranged_;
   MuldError error_;
 
@@ -90,7 +88,6 @@ class DownloadJob {
   size_t fileSize_;
 
   std::unique_ptr<Writer> writer_;
-  std::function<void(DownloadJob*)> start_download_;
   std::string etag_;
   std::string lastModified_;
   std::uint64_t createdAt_ = 0;
@@ -107,6 +104,8 @@ class DownloadJob {
   std::atomic<int> nConnections_;  // active connections (threads)
   std::mutex wait_mtx_, error_mtx_, disk_mtx_;
   std::condition_variable wait_cv_;
+
+  std::function<void(DownloadJob*)> start_download_;
 };
 
 }  // namespace muld

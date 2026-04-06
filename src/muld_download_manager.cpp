@@ -8,10 +8,10 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/version.hpp>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <filesystem>
 #include <string>
 
 #include "downloader.h"
@@ -53,7 +53,8 @@ std::optional<FileInfo> ResolveValidatedFileInfo(const Url& initial_url,
 }
 
 bool MatchesStoredFile(const JobImage& img, const FileInfo& info) {
-  if (img.file_size > 0 && info.total_size > 0 && img.file_size != info.total_size) {
+  if (img.file_size > 0 && info.total_size > 0 &&
+      img.file_size != info.total_size) {
     return false;
   }
   if (!img.etag.empty() && !info.etag.empty() && img.etag != info.etag) {
@@ -66,7 +67,7 @@ bool MatchesStoredFile(const JobImage& img, const FileInfo& info) {
   return true;
 }
 
-}
+}  // namespace
 
 MuldDownloadManager::~MuldDownloadManager() = default;
 
@@ -82,13 +83,8 @@ void MuldDownloadManager::EnqueueTasks(DownloadJob* job, int num_connections) {
   }
 }
 
-DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
+DownloaderResp MuldDownloadManager::Download(const MuldRequest& request) {
   Url parsed_url = ParseUrl(request.url);
-
-  // initialize job
-  auto job = std::make_shared<DownloadJob>(parsed_url, request.destination, request.max_connections);
-  jobs_.push_back(job);
-  jobs_index_[job->GetIdentityKey()] = job;
 
   FetchResult fetch_res;
   for (int redirect_count = 0; redirect_count < MAX_REDIRECT_ALLOW;
@@ -108,10 +104,8 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
       if (logger_) {
         logger_(LogLevel::Error, parsed_url.scheme + " is not supported!");
       }
-      job->Fail(ErrorCode::NotSupported,
-                parsed_url.scheme + " is not supported!");
-
-      return DownloadHandler(job.get());
+      return {{.code = ErrorCode::NotSupported,
+               .detail = parsed_url.scheme + " is not supported!"}, {}};
     }
 
     if (fetch_res.state == FetchResult::State::SUCCESSFUL) {
@@ -129,15 +123,14 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
         logger_(LogLevel::Info, "Location: " + url + " [following]");
       }
       parsed_url = ParseUrl(url);
-      job->SetUrl(parsed_url);
     } else {
       // Failed state
       auto& err = std::get<FetchError>(fetch_res.data);
       if (logger_) {
         logger_(LogLevel::Error, "HTTP request failed: " + err.message);
       }
-      job->Fail(err.error_code, err.message, err.https_status_code);
-      return DownloadHandler(job.get());  // Return gracefully failed handler
+
+      return {{.code = err.error_code, .detail = err.message}, {}};
     }
   }
 
@@ -146,8 +139,8 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
       logger_(LogLevel::Error, "Exceeded max redirects (" +
                                    std::to_string(MAX_REDIRECT_ALLOW) + ")");
     }
-    job->Fail(ErrorCode::MaxRedirectsExceeded, "Exceeded max redirects");
-    return DownloadHandler(job.get());
+    return {{.code = ErrorCode::MaxRedirectsExceeded,
+             .detail = "Exceeded max redirects"}, {}};
   }
 
   // create tasks
@@ -182,17 +175,19 @@ DownloadHandler MuldDownloadManager::Download(const MuldRequest& request) {
                                 actual_chunk_size);
   }
 
-  job->Init(info.total_size, info.supports_range, n_chunks,
-            [this](DownloadJob* job) {
-              this->EnqueueTasks(job, job->maxConnections_);
-            });
-  job->SetValidators(info.etag, info.last_modified);
+  auto job = std::make_shared<DownloadJob>(
+      parsed_url, request.destination, request.max_connections, info.total_size,
+      info.supports_range, n_chunks, [this](DownloadJob* job) {
+        this->EnqueueTasks(job, job->maxConnections_);
+      });
+  jobs_.push_back(job);
+  jobs_index_[job->GetIdentityKey()] = job;
 
-  // setting state to downloading will automatically create connections
+  job->SetValidators(info.etag, info.last_modified);
   job->SetState(DownloadJob::DownloadState::Downloading);
 
-  auto handler = DownloadHandler(job.get());
-  return handler;
+  auto handler = DownloadHandler(job);
+  return {job->GetError(), DownloadHandler(job)};
 }
 
 void MuldDownloadManager::WaitAll() {
@@ -210,44 +205,31 @@ void MuldDownloadManager::Terminate() {
   }
 }
 
-DownloadHandler MuldDownloadManager::Load(const std::string& path) {
-  auto make_failed_handler = [&](const Url& url, const std::string& output_path,
-                                 int max_connections, ErrorCode code,
-                                 const std::string& message) {
-    auto failed_job =
-        std::make_shared<DownloadJob>(url, output_path, max_connections);
-    failed_job->Fail(code, message);
-    jobs_.push_back(failed_job);
-    return DownloadHandler(failed_job.get());
-  };
-
+DownloaderResp MuldDownloadManager::Load(const std::string& path) {
   JobImage img;
   if (!ReadImageFromDisk(img, path)) {
-    return make_failed_handler(ParseUrl("http://invalid/"), "", 1,
-                               ErrorCode::SYSTEM_ERR,
-                               "Failed to read job image from disk");
+    return {MuldError{.code = ErrorCode::DiskError,
+                      .detail = "Can not load download"}, {}};
   }
 
   if (!loaded_images_.insert(path).second) {
-    return make_failed_handler(ParseUrl(img.url), img.file_path,
-                               img.max_connections, ErrorCode::SYSTEM_ERR,
-                               "This job image is already loaded");
+    return {MuldError{.code = ErrorCode::DuplicateJob,
+                      .detail = "Job already loaded"}, {}};
   }
 
   Url corrected_url;
   auto info = ResolveValidatedFileInfo(ParseUrl(img.url), corrected_url);
   if (!info.has_value()) {
     loaded_images_.erase(path);
-    return make_failed_handler(ParseUrl(img.url), img.file_path,
-                               img.max_connections, ErrorCode::NETWORK_ERR,
-                               "Failed to validate stored job URL");
+    return {MuldError{.code = ErrorCode::FetchFileInfoFailed,
+                      .detail = "Failed to fetch URL"}, {}};
   }
 
   if (!MatchesStoredFile(img, *info)) {
     loaded_images_.erase(path);
-    return make_failed_handler(corrected_url, img.file_path,
-                               img.max_connections, ErrorCode::HTTP_ERR,
-                               "Stored job image no longer matches remote file");
+    return {
+        MuldError{.code = ErrorCode::FetchFileInfoFailed,
+                  .detail = "Attachment does not match with current content"}, {}};
   }
 
   img.url = GetUrlString(corrected_url);
@@ -261,32 +243,33 @@ DownloadHandler MuldDownloadManager::Load(const std::string& path) {
   auto existing = jobs_index_.find(identity_key);
   if (existing != jobs_index_.end() && !existing->second.expired()) {
     loaded_images_.erase(path);
-    return make_failed_handler(corrected_url, img.file_path,
-                               img.max_connections, ErrorCode::SYSTEM_ERR,
-                               "An equivalent download job is already loaded");
+    return {
+        MuldError{.code = ErrorCode::FetchFileInfoFailed,
+                  .detail = "Attachment does not match with current content"}, {}};
   }
 
   if (!std::filesystem::exists(img.file_path)) {
     loaded_images_.erase(path);
-    return make_failed_handler(corrected_url, img.file_path,
-                               img.max_connections, ErrorCode::DISK_ERR,
-                               "Target file is missing on disk");
+    return {MuldError{.code = ErrorCode::DiskError,
+                      .detail = "Target file is missing on disk"}, {}};
   }
 
   auto local_size = std::filesystem::file_size(img.file_path);
   if (img.file_size > 0 && local_size != img.file_size) {
     loaded_images_.erase(path);
-    return make_failed_handler(
-        corrected_url, img.file_path, img.max_connections, ErrorCode::DISK_ERR,
-        "Target file size does not match stored job image");
+
+    return {MuldError{
+        .code = ErrorCode::DiskError,
+        .detail = "Target file size does not match stored job image"}, {}};
   }
 
-  auto job = std::make_shared<DownloadJob>(
-      img, [this](DownloadJob* job) { this->EnqueueTasks(job, job->maxConnections_); });
+  auto job = std::make_shared<DownloadJob>(img, [this](DownloadJob* job) {
+    this->EnqueueTasks(job, job->maxConnections_);
+  });
 
   jobs_.push_back(job);
   jobs_index_[job->GetIdentityKey()] = job;
-  return DownloadHandler(job.get());
+  return {MuldError(), DownloadHandler(job)};
 }
 
 }  // namespace muld
