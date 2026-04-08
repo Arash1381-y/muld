@@ -1,12 +1,25 @@
 #pragma once
 #include <functional>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace muld {
+
+struct Url {
+  std::string scheme;
+  std::string host;
+  std::string port;
+  std::string path;
+};
 
 ///////////////////////////////////////
 //////////////// error ////////////////
@@ -146,40 +159,46 @@ struct DownloadCallbacks {
 ///////////////////////////////////////
 ////////////// handler ////////////////
 ///////////////////////////////////////
-class DownloadJob;
-
-struct HandlerResp {
-  MuldError error;
-
-  bool ok() const { return error.code == ErrorCode::Ok; }
-  operator bool() const { return ok(); }
-};
+class DownloadEngine;
 
 struct ChunkProgress {
   std::size_t downloaded_bytes;
   std::size_t total_bytes;
 };
 
-class DownloadHandler {
+class DownloadTask {
  public:
-  explicit DownloadHandler(std::weak_ptr<DownloadJob> job);
+  DownloadTask(const Url& url, const std::string& output_path,
+               const DownloadCallbacks& callbacks = {});
+  ~DownloadTask() = default;
+
+  void AttachEngine(std::shared_ptr<DownloadEngine> engine);
+  void FailBeforeEngineStart(ErrorCode code, const std::string& detail);
 
   void AttachHandlerCallbacks(const DownloadCallbacks& callbacks);
 
-  HandlerResp Pause();
-  HandlerResp Resume();
-  HandlerResp Cancel();
-  void Wait() const;
+  void Pause();
+  void Resume();
+  void Cancel();
+  void WaitUntilFinished();
+  void Wait() { WaitUntilFinished(); }
 
+  DownloadState GetState() const;
+  const Url& GetUrl() const;
+
+  const MuldError& GetError() const;
+  size_t GetTotalSize() const;
+  size_t GetReceivedSize() const;
+  size_t GetDownloadSpeed() const;
+  size_t GetJobEta() const;
+  DownloadProgress GetProgress() const;
+  std::vector<ChunkProgress> GetChunksProgress() const;
   bool IsFinished() const;
   bool HasError() const;
 
-  const MuldError& GetError() const;
-  DownloadProgress GetProgress() const;
-  std::vector<ChunkProgress> GetChunksProgress() const;
-
  private:
-  std::weak_ptr<DownloadJob> job_;
+  struct SharedState;
+  std::shared_ptr<SharedState> shared_;
 };
 
 ///////////////////////////////////////
@@ -204,7 +223,7 @@ struct MuldRequest {
 
 struct DownloaderResp {
   MuldError error;
-  std::optional<DownloadHandler> handler;
+  std::optional<DownloadTask> task;
 
   bool ok() const { return error.code == ErrorCode::Ok; }
   operator bool() const { return ok(); }
@@ -225,14 +244,33 @@ class MuldDownloadManager {
   void Terminate();
 
  private:
-  void EnqueueTasks(DownloadJob* job, int connections);
+  struct PendingDownloadRequest {
+    enum class Kind { Download, Load };
+    Kind kind;
+    Url url;
+    std::string destination;
+    int max_connections = 1;
+    std::string image_path;
+    DownloadCallbacks callbacks;
+    DownloadTask task;
+  };
+
+  void DownloadDispatcherLoop();
+  void EnqueueTasks(DownloadEngine* job, int connections);
 
  private:
   LogCallback logger_;
-  std::unique_ptr<ThreadPool> threadpool_;
-  std::vector<std::shared_ptr<DownloadJob>> jobs_;
-  std::unordered_map<std::string, std::weak_ptr<DownloadJob>> jobs_index_;
+  std::mutex jobs_mtx_;
+  std::vector<std::shared_ptr<DownloadEngine>> jobs_;
+  std::unordered_map<std::string, std::weak_ptr<DownloadEngine>> jobs_index_;
   std::unordered_set<std::string> loaded_images_;
+  std::unique_ptr<ThreadPool> threadpool_;
+  std::thread dispatcher_thread_;
+  std::queue<PendingDownloadRequest> pending_requests_;
+  std::mutex pending_mtx_;
+  std::condition_variable pending_cv_;
+  bool stop_dispatcher_ = false;
+  std::vector<DownloadTask> tasks_;
 };
 
 ///////////////////////////////////////

@@ -1,154 +1,282 @@
 #include "download_handler.h"
 
-#include <memory>
-#include <vector>
+#include <functional>
+#include <mutex>
+
+#include "download_job.h"
+#include "url.h"
 
 namespace muld {
 
-DownloadHandler::DownloadHandler(std::weak_ptr<DownloadJob> job)
-    : job_(std::move(job)) {}
+namespace {
+bool IsTerminalState(DownloadState state) {
+  return state == DownloadState::Completed || state == DownloadState::Failed ||
+         state == DownloadState::Canceled || state == DownloadState::Paused;
+}
+}  // namespace
 
-void DownloadHandler::AttachHandlerCallbacks(
-    const DownloadCallbacks& callbacks) {
-  auto job = job_.lock();
-  if (!job) {
-    return;
-  }
+struct DownloadTask::SharedState {
+  explicit SharedState(const Url& in_url, std::string in_output,
+                       DownloadCallbacks in_callbacks)
+      : url(in_url),
+        output_path(std::move(in_output)),
+        callbacks(std::move(in_callbacks)) {}
 
-  job->AttachCallbacks(callbacks);
+  Url url;
+  std::string output_path;
+  DownloadCallbacks callbacks;
+
+  std::atomic<DownloadState> state{DownloadState::Initialized};
+  std::atomic<DownloadState> desired_state{DownloadState::Initialized};
+  MuldError error;
+
+  std::shared_ptr<DownloadEngine> engine;
+  std::mutex mtx;
+  std::condition_variable wait_cv;
+
+  DownloadProgress progress{
+      .total_bytes = 0,
+      .downloaded_bytes = 0,
+      .speed_bytes_per_sec = 0,
+      .eta_seconds = 0,
+      .percentage = 0.0f,
+  };
+  std::vector<ChunkProgress> chunks;
+};
+
+DownloadTask::DownloadTask(const Url& url, const std::string& output_path,
+                           const DownloadCallbacks& callbacks)
+    : shared_(
+          std::make_shared<SharedState>(url, std::string(output_path), callbacks)) {}
+
+void DownloadTask::AttachHandlerCallbacks(const DownloadCallbacks& callbacks) {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  shared_->callbacks = callbacks;
 }
 
-void DownloadHandler::Wait() const {
-  auto job = job_.lock();
-  if (!job) return;
-  job->WaitUntilFinished();
+void DownloadTask::AttachEngine(std::shared_ptr<DownloadEngine> engine) {
+  if (!engine) return;
+
+  std::weak_ptr<SharedState> weak_shared = shared_;
+  engine->AttachCallbacks(DownloadCallbacks{
+      .on_progress =
+          [weak_shared](const DownloadProgress& progress) {
+            auto shared = weak_shared.lock();
+            if (!shared) return;
+            std::function<void(const DownloadProgress&)> cb;
+            {
+              std::lock_guard<std::mutex> lock(shared->mtx);
+              shared->progress = progress;
+              cb = shared->callbacks.on_progress;
+            }
+            if (cb) cb(progress);
+          },
+      .on_chunk_progress =
+          [weak_shared](const ChunkProgressEvent& event) {
+            auto shared = weak_shared.lock();
+            if (!shared) return;
+            std::function<void(const ChunkProgressEvent&)> cb;
+            {
+              std::lock_guard<std::mutex> lock(shared->mtx);
+              if (event.chunk_id >= shared->chunks.size()) {
+                shared->chunks.resize(event.chunk_id + 1);
+              }
+              shared->chunks[event.chunk_id] =
+                  ChunkProgress{event.downloaded_bytes, event.total_bytes};
+              cb = shared->callbacks.on_chunk_progress;
+            }
+            if (cb) cb(event);
+          },
+      .on_state_change =
+          [weak_shared](DownloadState state) {
+            auto shared = weak_shared.lock();
+            if (!shared) return;
+            std::function<void(DownloadState)> cb;
+            {
+              std::lock_guard<std::mutex> lock(shared->mtx);
+              shared->state.store(state);
+              cb = shared->callbacks.on_state_change;
+            }
+            if (cb) cb(state);
+            if (IsTerminalState(state)) shared->wait_cv.notify_all();
+          },
+      .on_finish =
+          [weak_shared]() {
+            auto shared = weak_shared.lock();
+            if (!shared) return;
+            std::function<void()> cb;
+            {
+              std::lock_guard<std::mutex> lock(shared->mtx);
+              shared->state.store(DownloadState::Completed);
+              cb = shared->callbacks.on_finish;
+            }
+            if (cb) cb();
+            shared->wait_cv.notify_all();
+          },
+      .on_error =
+          [weak_shared](MuldError error) {
+            auto shared = weak_shared.lock();
+            if (!shared) return;
+            std::function<void(MuldError)> cb;
+            {
+              std::lock_guard<std::mutex> lock(shared->mtx);
+              shared->error = error;
+              shared->state.store(DownloadState::Failed);
+              cb = shared->callbacks.on_error;
+            }
+            if (cb) cb(error);
+            shared->wait_cv.notify_all();
+          },
+  });
+
+  DownloadState desired = shared_->state.load();
+  desired = shared_->desired_state.load();
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    shared_->engine = std::move(engine);
+    shared_->url = shared_->engine->GetUrl();
+    shared_->progress.total_bytes = shared_->engine->GetTotalSize();
+    shared_->chunks.clear();
+    shared_->chunks.reserve(shared_->engine->GetNumChunks());
+    for (size_t i = 0; i < shared_->engine->GetNumChunks(); ++i) {
+      auto& chunk = shared_->engine->GetChunkInfo(i);
+      shared_->chunks.push_back(
+          ChunkProgress{chunk.GetReceivedSize(), chunk.GetTotalSize()});
+    }
+  }
+
+  if (desired == DownloadState::Canceled) {
+    shared_->engine->Cancel();
+  } else if (desired == DownloadState::Paused) {
+    shared_->engine->Pause();
+  } else if (desired == DownloadState::Queued) {
+    shared_->engine->Resume();
+  }
 }
 
-HandlerResp DownloadHandler::Pause() {
-  auto job = job_.lock();
-  if (!job) {
-    return {
-        {.code = ErrorCode::NotInitialized,
-         .detail = "Handler references an invalid or expired job"},
-    };
+void DownloadTask::FailBeforeEngineStart(ErrorCode code,
+                                         const std::string& detail) {
+  std::function<void(MuldError)> cb;
+  MuldError err = {.code = code, .detail = detail};
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    shared_->error = err;
+    shared_->state.store(DownloadState::Failed);
+    shared_->desired_state.store(DownloadState::Failed);
+    cb = shared_->callbacks.on_error;
   }
-
-  if (!job->Pause()) {
-    return {
-        {.code = ErrorCode::InvalidState, .detail = "Invalid state change"},
-    };
-  }
-
-  return {MuldError()};
+  if (cb) cb(err);
+  shared_->wait_cv.notify_all();
 }
 
-HandlerResp DownloadHandler::Resume() {
-  auto job = job_.lock();
-  if (!job) {
-    return {
-        {.code = ErrorCode::NotInitialized,
-         .detail = "Handler references an invalid or expired job"},
-    };
+void DownloadTask::Pause() {
+  std::shared_ptr<DownloadEngine> engine;
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    engine = shared_->engine;
+    shared_->desired_state.store(DownloadState::Paused);
+    if (!engine) {
+      shared_->state.store(DownloadState::Paused);
+      return;
+    }
   }
+  engine->Pause();
+}
 
-  if (!job->Resume()) {
-    return {MuldError{.code = ErrorCode::InvalidState,
-                      .detail = "Invalid state change"}};
-  } else {
-    return {MuldError()};
+void DownloadTask::Resume() {
+  std::shared_ptr<DownloadEngine> engine;
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    engine = shared_->engine;
+    shared_->desired_state.store(DownloadState::Queued);
+    if (!engine) {
+      shared_->state.store(DownloadState::Queued);
+      return;
+    }
+  }
+  engine->Resume();
+}
+
+void DownloadTask::Cancel() {
+  std::shared_ptr<DownloadEngine> engine;
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    engine = shared_->engine;
+    shared_->desired_state.store(DownloadState::Canceled);
+    if (!engine) {
+      shared_->state.store(DownloadState::Canceled);
+      shared_->wait_cv.notify_all();
+      return;
+    }
+  }
+  engine->Cancel();
+}
+
+void DownloadTask::WaitUntilFinished() {
+  std::shared_ptr<DownloadEngine> engine;
+  {
+    std::unique_lock<std::mutex> lock(shared_->mtx);
+    if (!shared_->engine && IsTerminalState(shared_->state.load())) return;
+    shared_->wait_cv.wait(lock, [this]() {
+      return shared_->engine != nullptr || IsTerminalState(shared_->state.load());
+    });
+    engine = shared_->engine;
+  }
+  if (engine) {
+    engine->WaitUntilFinished();
   }
 }
 
-HandlerResp DownloadHandler::Cancel() {
-  auto job = job_.lock();
-  if (!job) {
-    return {
-        {.code = ErrorCode::NotInitialized,
-         .detail = "Handler references an invalid or expired job"},
-    };
-  }
+DownloadState DownloadTask::GetState() const { return shared_->state.load(); }
 
-  if (!job->Cancel()) {
-    return {MuldError{.code = ErrorCode::InvalidState,
-                      .detail = "Invalid state change"}};
-  } else {
-    return {MuldError()};
+const Url& DownloadTask::GetUrl() const { return shared_->url; }
+
+const MuldError& DownloadTask::GetError() const {
+  thread_local MuldError snapshot;
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    snapshot = shared_->error;
   }
+  return snapshot;
 }
 
-bool DownloadHandler::IsFinished() const {
-  auto job = job_.lock();
-  if (!job) {
-    // user should be aware of false return for invalid job
-    return false;
-  }
-
-  return job->IsFinished();
+size_t DownloadTask::GetTotalSize() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->progress.total_bytes;
 }
 
-bool DownloadHandler::HasError() const {
-  auto job = job_.lock();
-  if (!job) {
-    // user should be aware of false return for invalid job
-    return false;
-  }
-
-  return job->GetError().code != ErrorCode::Ok;
+size_t DownloadTask::GetReceivedSize() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->progress.downloaded_bytes;
 }
 
-DownloadProgress DownloadHandler::GetProgress() const {
-  auto job = job_.lock();
-  if (!job) {
-    return DownloadProgress{
-        .total_bytes = 0,
-        .downloaded_bytes = 0,
-        .speed_bytes_per_sec = 0,
-        .eta_seconds = 0,
-        .percentage = 0.0f,
-    };
-  }
-
-  DownloadProgress dp;
-  dp.total_bytes = job->GetTotalSize();
-  dp.downloaded_bytes = job->GetReceivedSize();
-  dp.speed_bytes_per_sec = job->GetDownloadSpeed();
-  dp.eta_seconds = job->GetJobEta();
-
-  if (dp.total_bytes > 0) {
-    dp.percentage = static_cast<float>(dp.downloaded_bytes) /
-                    static_cast<float>(dp.total_bytes) * 100;
-  }
-  return dp;
+size_t DownloadTask::GetDownloadSpeed() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->progress.speed_bytes_per_sec;
 }
 
-std::vector<ChunkProgress> DownloadHandler::GetChunksProgress() const {
-  auto job = job_.lock();
-  if (!job) {
-    return {};
-  }
-  std::vector<ChunkProgress> chunks_info;
-  chunks_info.reserve(job->GetNumChunks());
-
-  for (size_t i = 0; i < job->GetNumChunks(); i++) {
-    const auto& chunk_info = job->GetChunkInfo(i);
-    chunks_info.push_back(
-        {chunk_info.GetReceivedSize(),  // No longer truncated to int
-         chunk_info.GetTotalSize()});
-  }
-
-  return chunks_info;
+size_t DownloadTask::GetJobEta() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->progress.eta_seconds;
 }
 
-const MuldError& DownloadHandler::GetError() const {
-  auto job = job_.lock();
-  if (!job) {
-    static const MuldError kInvalidJobError = {
-        .code = ErrorCode::NotInitialized,
-        .detail = "Handler references an invalid or expired job",
-    };
-    return kInvalidJobError;
-  }
-  return job->GetError();
+DownloadProgress DownloadTask::GetProgress() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->progress;
+}
+
+std::vector<ChunkProgress> DownloadTask::GetChunksProgress() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->chunks;
+}
+
+bool DownloadTask::IsFinished() const {
+  return IsTerminalState(shared_->state.load());
+}
+
+bool DownloadTask::HasError() const {
+  std::lock_guard<std::mutex> lock(shared_->mtx);
+  return shared_->error.code != ErrorCode::Ok;
 }
 
 }  // namespace muld

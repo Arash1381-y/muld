@@ -22,10 +22,10 @@ std::uint64_t GetUnixTimestamp() {
 }
 }  // namespace
 
-DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
+DownloadEngine::DownloadEngine(const Url& url, const std::string& output_path,
                          int max_connections, size_t file_size, bool ranged,
                          size_t n_chunks,
-                         std::function<void(DownloadJob*)> start_download,
+                         std::function<void(DownloadEngine*)> start_download,
                          const DownloadCallbacks& callbacks)
     : maxConnections_(max_connections),
       ranged_(ranged),
@@ -67,8 +67,8 @@ DownloadJob::DownloadJob(const Url& url, const std::string& output_path,
   }
 }
 
-DownloadJob::DownloadJob(const JobImage& image,
-                         std::function<void(DownloadJob*)> start_download,
+DownloadEngine::DownloadEngine(const JobImage& image,
+                         std::function<void(DownloadEngine*)> start_download,
                          const DownloadCallbacks& callbacks)
     : lastSpeedCalcTime_(std::chrono::steady_clock::now()),
       lastProgressCallbackTime_(std::chrono::steady_clock::now()),
@@ -115,18 +115,18 @@ DownloadJob::DownloadJob(const JobImage& image,
   nReceivedBytesFromLastStore_ = already_downloaded;
 }
 
-void DownloadJob::SetValidators(const std::string& etag,
+void DownloadEngine::SetValidators(const std::string& etag,
                                 const std::string& last_modified) {
   etag_ = etag;
   lastModified_ = last_modified;
 }
 
-void DownloadJob::AttachCallbacks(const DownloadCallbacks& callbacks) {
+void DownloadEngine::AttachCallbacks(const DownloadCallbacks& callbacks) {
   std::lock_guard<std::mutex> lock(callbacks_mtx_);
   callbacks_ = callbacks;
 }
 
-void DownloadJob::NotifyConnectionOpen() {
+void DownloadEngine::NotifyConnectionOpen() {
   nConnections_.fetch_add(1);
 
   auto expected = DownloadState::Queued;
@@ -142,26 +142,26 @@ void DownloadJob::NotifyConnectionOpen() {
   }
 }
 
-void DownloadJob::NotifyConnectionClose() { nConnections_.fetch_sub(1); }
+void DownloadEngine::NotifyConnectionClose() { nConnections_.fetch_sub(1); }
 
 // used for redirection
-void DownloadJob::SetUrl(const Url& url) { url_ = url; }
+void DownloadEngine::SetUrl(const Url& url) { url_ = url; }
 
-const Url& DownloadJob::GetUrl() const { return url_; }
+const Url& DownloadEngine::GetUrl() const { return url_; }
 
-bool DownloadJob::IsRanged() const { return ranged_; }
+bool DownloadEngine::IsRanged() const { return ranged_; }
 
-std::string DownloadJob::GetIdentityKey() const {
+std::string DownloadEngine::GetIdentityKey() const {
   return outputPath_ + "\n" + GetUrlString(url_);
 }
 
-WorkItem* DownloadJob::GetNextWorkItem() {
+WorkItem* DownloadEngine::GetNextWorkItem() {
   size_t idx = nextWorkItem_.fetch_add(1);
   if (idx >= pendingWork_.size()) return nullptr;
   return &pendingWork_[idx];
 }
 
-ChunkInfo& DownloadJob::GetChunkInfo(size_t index) {
+ChunkInfo& DownloadEngine::GetChunkInfo(size_t index) {
   if (index >= nChunks_) {
     throw std::runtime_error("Chunk index is invalid");
   }
@@ -169,24 +169,24 @@ ChunkInfo& DownloadJob::GetChunkInfo(size_t index) {
   return chunksInfo_.at(index);
 }
 
-Writer& DownloadJob::GetWriter() { return *writer_; }
-const Writer& DownloadJob::GetWriter() const { return *writer_; }
+Writer& DownloadEngine::GetWriter() { return *writer_; }
+const Writer& DownloadEngine::GetWriter() const { return *writer_; }
 
-size_t DownloadJob::GetNumChunks() const { return nChunks_; }
+size_t DownloadEngine::GetNumChunks() const { return nChunks_; }
 
-const MuldError& DownloadJob::GetError() const { return error_; }
+const MuldError& DownloadEngine::GetError() const { return error_; }
 
-size_t DownloadJob::GetTotalSize() const { return fileSize_; };
+size_t DownloadEngine::GetTotalSize() const { return fileSize_; };
 
-size_t DownloadJob::GetReceivedSize() const {
+size_t DownloadEngine::GetReceivedSize() const {
   return nTotalReceivedBytes_.load();
 };
 
-size_t DownloadJob::GetDownloadSpeed() const { return downloadSpeed_.load(); };
+size_t DownloadEngine::GetDownloadSpeed() const { return downloadSpeed_.load(); };
 
-size_t DownloadJob::GetJobEta() const { return eta_.load(); };
+size_t DownloadEngine::GetJobEta() const { return eta_.load(); };
 
-void DownloadJob::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
+void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
   auto& chunk = chunksInfo_.at(chunk_id);
   chunk.UpdateReceived(bytes);
 
@@ -301,7 +301,7 @@ void DownloadJob::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
   }
 }
 
-bool DownloadJob::IsFinished() const {
+bool DownloadEngine::IsFinished() const {
   return nDownloadedChunks_.load() == nChunks_ ||
          state_.load() == DownloadState::Canceled ||
          state_.load() == DownloadState::Paused ||
@@ -309,12 +309,12 @@ bool DownloadJob::IsFinished() const {
          state_.load() == DownloadState::Failed;
 }
 
-void DownloadJob::WaitUntilFinished() {
+void DownloadEngine::WaitUntilFinished() {
   std::unique_lock<std::mutex> lock(wait_mtx_);
   wait_cv_.wait(lock, [this]() { return IsFinished(); });
 }
 
-void DownloadJob::BuildPendingWork() {
+void DownloadEngine::BuildPendingWork() {
   pendingWork_.clear();
   size_t work_id = 0;
   size_t finished_count = 0;
@@ -335,7 +335,7 @@ void DownloadJob::BuildPendingWork() {
   nDownloadedChunks_ = finished_count;
 }
 
-bool DownloadJob::Start() {
+bool DownloadEngine::Start() {
   if (!SetState(DownloadState::Queued)) return false;
 
   // Wait for any dangling connections to close
@@ -357,7 +357,7 @@ bool DownloadJob::Start() {
   return true;
 }
 
-bool DownloadJob::Resume() {
+bool DownloadEngine::Resume() {
   if (!SetState(DownloadState::Queued)) return false;
 
   // Wait for any dangling connections to close
@@ -379,7 +379,7 @@ bool DownloadJob::Resume() {
   return true;
 }
 
-bool DownloadJob::Pause() {
+bool DownloadEngine::Pause() {
   if (!SetState(DownloadState::Paused)) return false;
 
   // Wake up any threads waiting on conditions
@@ -389,7 +389,7 @@ bool DownloadJob::Pause() {
   return true;
 }
 
-bool DownloadJob::Cancel() {
+bool DownloadEngine::Cancel() {
   if (!SetState(DownloadState::Canceled)) return false;
 
   // Wake up any threads waiting on conditions
@@ -401,7 +401,7 @@ bool DownloadJob::Cancel() {
   return true;
 }
 
-void DownloadJob::Fail(ErrorCode code, const std::string& detail,
+void DownloadEngine::Fail(ErrorCode code, const std::string& detail,
                        int http_status) {
   if (!SetState(DownloadState::Failed)) return;
 
@@ -433,7 +433,7 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
 }
 
 
-bool DownloadJob::SetState(DownloadState next_state) {
+bool DownloadEngine::SetState(DownloadState next_state) {
   bool state_changed = false;
 
   if (next_state == DownloadState::Queued) {
@@ -502,14 +502,14 @@ bool DownloadJob::SetState(DownloadState next_state) {
   return false;
 }
 
-DownloadState DownloadJob::GetState() const { return state_.load(); }
+DownloadState DownloadEngine::GetState() const { return state_.load(); }
 
-void DownloadJob::Store() {
+void DownloadEngine::Store() {
   std::lock_guard<std::mutex> disk_lock(disk_mtx_);
   StoreUnlocked();
 }
 
-void DownloadJob::StoreUnlocked() {
+void DownloadEngine::StoreUnlocked() {
   auto chunks = std::vector<ChunkState>();
   for (const auto& c : chunksInfo_) {
     chunks.emplace_back(ChunkState{.start_range = c.startRange_,
@@ -539,7 +539,7 @@ void DownloadJob::StoreUnlocked() {
   nReceivedBytesFromLastStore_ = 0;
 }
 
-bool DownloadJob::NeedsStore() const {
+bool DownloadEngine::NeedsStore() const {
   return nReceivedBytesFromLastStore_ >= 10 * 1024 * 1024;  // 10 MB
 }
 

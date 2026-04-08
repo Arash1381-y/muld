@@ -1,6 +1,7 @@
 #include "url.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace muld {
 

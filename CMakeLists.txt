@@ -45,7 +45,7 @@ add_library(muld STATIC
     src/url.cpp
 )
 
-target_include_directories(muld PUBLIC src)
+target_include_directories(muld PUBLIC src include)
 
 
 target_link_libraries(muld
@@ -86,9 +86,26 @@ add_executable(muld_test_terminate_load tests/test_terminate_load.cpp)
 target_link_libraries(muld_test_terminate_load PRIVATE muld)
 target_include_directories(muld_test_terminate_load PRIVATE include)
 
+add_executable(muld_test_callbacks_progress tests/test_callbacks_progress.cpp)
+target_link_libraries(muld_test_callbacks_progress PRIVATE muld)
+target_include_directories(muld_test_callbacks_progress PRIVATE include)
+
+add_executable(muld_test_attach_callbacks_threadsafe
+    tests/test_attach_callbacks_threadsafe.cpp)
+target_link_libraries(muld_test_attach_callbacks_threadsafe PRIVATE muld)
+target_include_directories(muld_test_attach_callbacks_threadsafe PRIVATE include)
+
+add_executable(muld_test_chunk_stability_pause_resume
+    tests/test_chunk_stability_pause_resume.cpp)
+target_link_libraries(muld_test_chunk_stability_pause_resume PRIVATE muld)
+target_include_directories(muld_test_chunk_stability_pause_resume PRIVATE include)
+
 # Register it with CTest
 add_test(NAME PauseResumeTest COMMAND muld_test_pause_resume)
 add_test(NAME TerminateLoadTest COMMAND muld_test_terminate_load)
+add_test(NAME CallbacksProgressTest COMMAND muld_test_callbacks_progress)
+add_test(NAME AttachCallbacksThreadsafeTest COMMAND muld_test_attach_callbacks_threadsafe)
+add_test(NAME ChunkStabilityPauseResumeTest COMMAND muld_test_chunk_stability_pause_resume)
 
 # Install the library, executable, and export the targets
 install(TARGETS muld_cli

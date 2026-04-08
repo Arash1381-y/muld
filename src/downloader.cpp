@@ -30,8 +30,8 @@ concept StreamType = std::is_same_v<T, beast::tcp_stream> ||
     std::is_same_v<T, beast::ssl_stream<beast::tcp_stream>>;
 
 struct ConnectionGuard {
-  DownloadJob* job;
-  explicit ConnectionGuard(DownloadJob* j) : job(j) {
+  DownloadEngine* job;
+  explicit ConnectionGuard(DownloadEngine* j) : job(j) {
     job->NotifyConnectionOpen();
   }
   ~ConnectionGuard() { job->NotifyConnectionClose(); }
@@ -118,7 +118,7 @@ void ValidateResponse(const http::response_parser<http::buffer_body>& parser,
 template <StreamType T>
 bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
                       http::response_parser<http::buffer_body>& parser,
-                      DownloadJob* job, std::size_t chunk_id,
+                      DownloadEngine* job, std::size_t chunk_id,
                       std::size_t& current_offset) {
   constexpr std::size_t BUFFER_SIZE = 32768;
   char body_buffer[BUFFER_SIZE];

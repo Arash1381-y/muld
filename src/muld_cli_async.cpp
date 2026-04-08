@@ -117,7 +117,7 @@ int main(int argc, char* argv[]) {
   cout << "Starting download...\nURL:  " << url << "\nDest: " << out
        << "\nConn: " << conn << "\n\n";
 
-  auto [err, handler] =
+  auto [err, task] =
       mgr.Download({url.c_str(), out.c_str(), conn},
                    {.on_progress =
                         [&](const auto& p) {
@@ -132,7 +132,7 @@ int main(int argc, char* argv[]) {
 
   if (err) return cli_logger(LogLevel::Error, err.detail), 1;
 
-  while (!handler->IsFinished()) {
+  while (!task->IsFinished()) {
     if (!c_mod && !d_mod) continue;
     c_mod = d_mod = false;
 

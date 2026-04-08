@@ -6,7 +6,7 @@
 namespace muld {
 
 struct Task {
-  DownloadJob* job;
+  DownloadEngine* job;
   LogCallback logger = nullptr;
 };
 

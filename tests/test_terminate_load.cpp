@@ -72,10 +72,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[Test] Resuming loaded job...\n";
-    if (!handler->Resume()) {
-      std::cerr << "[Test Failed] Resume on loaded job returned false.\n";
-      return 1;
-    }
+    handler->Resume();
 
     while (!handler->IsFinished()) {
       auto progress = handler->GetProgress();
