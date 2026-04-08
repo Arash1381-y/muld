@@ -20,6 +20,7 @@ namespace muld {
 
 enum class DownloadState {
   Initialized,
+  Queued,
   Downloading,
   Completed,
   Failed,
@@ -121,6 +122,7 @@ class DownloadJob {
 
  private:
   bool SetState(DownloadState state);
+  void StoreUnlocked();
 
   bool NeedsStore() const;
   void BuildPendingWork();

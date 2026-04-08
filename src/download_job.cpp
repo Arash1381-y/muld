@@ -126,7 +126,21 @@ void DownloadJob::AttachCallbacks(const DownloadCallbacks& callbacks) {
   callbacks_ = callbacks;
 }
 
-void DownloadJob::NotifyConnectionOpen() { nConnections_.fetch_add(1); }
+void DownloadJob::NotifyConnectionOpen() {
+  nConnections_.fetch_add(1);
+
+  auto expected = DownloadState::Queued;
+  if (state_.compare_exchange_strong(expected, DownloadState::Downloading)) {
+    std::function<void(DownloadState)> on_state_change_cb;
+    {
+      std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+      on_state_change_cb = callbacks_.on_state_change;
+    }
+    if (on_state_change_cb) {
+      on_state_change_cb(DownloadState::Downloading);
+    }
+  }
+}
 
 void DownloadJob::NotifyConnectionClose() { nConnections_.fetch_sub(1); }
 
@@ -203,38 +217,50 @@ void DownloadJob::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
   }
 
   // Fire on_chunk_progress (lightweight, every call)
+  ChunkProgressEvent evt;
+  evt.chunk_id = chunk_id;
+  evt.downloaded_bytes = chunk.GetReceivedSize();
+  evt.total_bytes = chunk.GetTotalSize();
+  evt.finished = chunk.IsFinished();
+  std::function<void(const ChunkProgressEvent&)> on_chunk_progress_cb;
   {
     std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
-    if (callbacks_.on_chunk_progress) {
-      ChunkProgressEvent evt;
-      evt.chunk_id = chunk_id;
-      evt.downloaded_bytes = chunk.GetReceivedSize();
-      evt.total_bytes = chunk.GetTotalSize();
-      evt.finished = chunk.IsFinished();
-      callbacks_.on_chunk_progress(evt);
-    }
+    on_chunk_progress_cb = callbacks_.on_chunk_progress;
+  }
+  if (on_chunk_progress_cb) {
+    on_chunk_progress_cb(evt);
   }
 
   // Fire throttled on_progress (~500ms)
   if (should_fire_progress) {
-    std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
-    if (callbacks_.on_progress) {
-      DownloadProgress dp;
-      dp.total_bytes = fileSize_;
-      dp.downloaded_bytes = nTotalReceivedBytes_.load();
-      dp.speed_bytes_per_sec = static_cast<size_t>(downloadSpeed_.load());
-      dp.eta_seconds = static_cast<size_t>(eta_.load());
-      dp.percentage = fileSize_ > 0
-          ? static_cast<float>(dp.downloaded_bytes) / static_cast<float>(fileSize_) * 100.0f
-          : 0.0f;
-      callbacks_.on_progress(dp);
+    DownloadProgress dp;
+    dp.total_bytes = fileSize_;
+    dp.downloaded_bytes = nTotalReceivedBytes_.load();
+    dp.speed_bytes_per_sec = static_cast<size_t>(downloadSpeed_.load());
+    dp.eta_seconds = static_cast<size_t>(eta_.load());
+    dp.percentage =
+        fileSize_ > 0
+            ? static_cast<float>(dp.downloaded_bytes) /
+                  static_cast<float>(fileSize_) * 100.0f
+            : 0.0f;
+    std::function<void(const DownloadProgress&)> on_progress_cb;
+    {
+      std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+      on_progress_cb = callbacks_.on_progress;
+    }
+    if (on_progress_cb) {
+      on_progress_cb(dp);
     }
   }
 
   {
-    std::lock_guard<std::mutex> disk_lock(disk_mtx_);
-    nReceivedBytesFromLastStore_ += bytes;
-    if (NeedsStore()) {
+    bool should_store = false;
+    {
+      std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+      nReceivedBytesFromLastStore_ += bytes;
+      should_store = NeedsStore();
+    }
+    if (should_store) {
       Store();
     }
   }
@@ -245,30 +271,28 @@ void DownloadJob::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
       // All chunks done
       auto expected = DownloadState::Downloading;
       if (state_.compare_exchange_strong(expected, DownloadState::Completed)) {
-        {
-          std::lock_guard<std::mutex> disk_lock(disk_mtx_);
-          Store();
-        }
+        Store();
+        std::function<void()> on_finish_cb;
         {
           std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
-          if (callbacks_.on_finish) {
-            callbacks_.on_finish();
-          }
+          on_finish_cb = callbacks_.on_finish;
+        }
+        if (on_finish_cb) {
+          on_finish_cb();
         }
         std::lock_guard<std::mutex> wait_lock(wait_mtx_);
         wait_cv_.notify_all();
       } else if (expected == DownloadState::Paused ||
                  expected == DownloadState::Failed) {
         state_.store(DownloadState::Completed);
-        {
-          std::lock_guard<std::mutex> disk_lock(disk_mtx_);
-          Store();
-        }
+        Store();
+        std::function<void()> on_finish_cb;
         {
           std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
-          if (callbacks_.on_finish) {
-            callbacks_.on_finish();
-          }
+          on_finish_cb = callbacks_.on_finish;
+        }
+        if (on_finish_cb) {
+          on_finish_cb();
         }
         std::lock_guard<std::mutex> wait_lock(wait_mtx_);
         wait_cv_.notify_all();
@@ -312,7 +336,7 @@ void DownloadJob::BuildPendingWork() {
 }
 
 bool DownloadJob::Start() {
-  if (!SetState(DownloadState::Downloading)) return false;
+  if (!SetState(DownloadState::Queued)) return false;
 
   // Wait for any dangling connections to close
   while (nConnections_.load() != 0) {
@@ -334,7 +358,7 @@ bool DownloadJob::Start() {
 }
 
 bool DownloadJob::Resume() {
-  if (!SetState(DownloadState::Downloading)) return false;
+  if (!SetState(DownloadState::Queued)) return false;
 
   // Wait for any dangling connections to close
   while (nConnections_.load() != 0) {
@@ -383,7 +407,6 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
 
   {
     // write to disk the current progress
-    std::lock_guard<std::mutex> disk_lock(disk_mtx_);
     this->Store();
   }
 
@@ -399,11 +422,13 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
     wait_cv_.notify_all();
   }
 
+  std::function<void(MuldError)> on_error_cb;
   {
     std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
-    if (callbacks_.on_error) {
-      callbacks_.on_error(error_);
-    }
+    on_error_cb = callbacks_.on_error;
+  }
+  if (on_error_cb) {
+    on_error_cb(error_);
   }
 }
 
@@ -411,25 +436,35 @@ void DownloadJob::Fail(ErrorCode code, const std::string& detail,
 bool DownloadJob::SetState(DownloadState next_state) {
   bool state_changed = false;
 
-  if (next_state == DownloadState::Downloading) {
+  if (next_state == DownloadState::Queued) {
     auto current = state_.load();
     while (current == DownloadState::Initialized ||
            current == DownloadState::Paused ||
            current == DownloadState::Canceled ||
            current == DownloadState::Failed) {
-      if (state_.compare_exchange_strong(current, DownloadState::Downloading)) {
+      if (state_.compare_exchange_strong(current, DownloadState::Queued)) {
         state_changed = true;
         break;
       }
     }
-  } else if (next_state == DownloadState::Paused) {
-    auto expected = DownloadState::Downloading;
-    if (state_.compare_exchange_strong(expected, DownloadState::Paused)) {
+  } else if (next_state == DownloadState::Downloading) {
+    auto expected = DownloadState::Queued;
+    if (state_.compare_exchange_strong(expected, DownloadState::Downloading)) {
       state_changed = true;
+    }
+  } else if (next_state == DownloadState::Paused) {
+    auto current = state_.load();
+    while (current == DownloadState::Downloading ||
+           current == DownloadState::Queued) {
+      if (state_.compare_exchange_strong(current, DownloadState::Paused)) {
+        state_changed = true;
+        break;
+      }
     }
   } else if (next_state == DownloadState::Canceled) {
     auto current = state_.load();
     while (current == DownloadState::Downloading ||
+           current == DownloadState::Queued ||
            current == DownloadState::Paused ||
            current == DownloadState::Failed) {
       if (state_.compare_exchange_strong(current, DownloadState::Canceled)) {
@@ -439,7 +474,8 @@ bool DownloadJob::SetState(DownloadState next_state) {
     }
   } else if (next_state == DownloadState::Failed) {
     auto current = state_.load();
-    while (current == DownloadState::Downloading) {
+    while (current == DownloadState::Downloading ||
+           current == DownloadState::Queued) {
       if (state_.compare_exchange_strong(current, DownloadState::Failed)) {
         state_changed = true;
         break;
@@ -452,9 +488,13 @@ bool DownloadJob::SetState(DownloadState next_state) {
   }
 
   if (state_changed) {
-    std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
-    if (callbacks_.on_state_change) {
-      callbacks_.on_state_change(next_state);
+    std::function<void(DownloadState)> on_state_change_cb;
+    {
+      std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
+      on_state_change_cb = callbacks_.on_state_change;
+    }
+    if (on_state_change_cb) {
+      on_state_change_cb(next_state);
     }
     return true;
   }
@@ -465,6 +505,11 @@ bool DownloadJob::SetState(DownloadState next_state) {
 DownloadState DownloadJob::GetState() const { return state_.load(); }
 
 void DownloadJob::Store() {
+  std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+  StoreUnlocked();
+}
+
+void DownloadJob::StoreUnlocked() {
   auto chunks = std::vector<ChunkState>();
   for (const auto& c : chunksInfo_) {
     chunks.emplace_back(ChunkState{.start_range = c.startRange_,
