@@ -1,5 +1,7 @@
 #include "url.h"
 
+#include <algorithm>
+
 namespace muld {
 
 Url ParseUrl(const std::string& url_string) {
@@ -18,11 +20,30 @@ Url ParseUrl(const std::string& url_string) {
   }
 
   std::size_t path_start = url_string.find('/', pos);
+  std::size_t query_start = url_string.find('?', pos);
+  std::size_t fragment_start = url_string.find('#', pos);
+  std::size_t host_end = std::string::npos;
+  if (path_start != std::string::npos) host_end = path_start;
+  if (query_start != std::string::npos) {
+    host_end = (host_end == std::string::npos) ? query_start
+                                               : std::min(host_end, query_start);
+  }
+  if (fragment_start != std::string::npos) {
+    host_end = (host_end == std::string::npos)
+                   ? fragment_start
+                   : std::min(host_end, fragment_start);
+  }
+
   std::string host_port;
-  if (path_start != std::string::npos) {
-    if (path_start != std::string::npos && path_start > pos) {
-      host_port = url_string.substr(pos, path_start - pos);
-      result.path = url_string.substr(path_start);
+  if (host_end != std::string::npos) {
+    if (host_end > pos) {
+      host_port = url_string.substr(pos, host_end - pos);
+      if (url_string[host_end] == '/') {
+        result.path = url_string.substr(host_end);
+      } else {
+        result.path = url_string.substr(host_end);
+        result.path.insert(result.path.begin(), '/');
+      }
     } else {
       host_port = url_string.substr(pos);
       result.path = std::string("/");
