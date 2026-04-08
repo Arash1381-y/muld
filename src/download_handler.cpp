@@ -18,7 +18,11 @@ void DownloadHandler::AttachHandlerCallbacks(
   job->AttachCallbacks(callbacks);
 }
 
-void DownloadHandler::Wait() const { job_.lock()->WaitUntilFinished(); }
+void DownloadHandler::Wait() const {
+  auto job = job_.lock();
+  if (!job) return;
+  job->WaitUntilFinished();
+}
 
 HandlerResp DownloadHandler::Pause() {
   auto job = job_.lock();
@@ -94,6 +98,16 @@ bool DownloadHandler::HasError() const {
 
 DownloadProgress DownloadHandler::GetProgress() const {
   auto job = job_.lock();
+  if (!job) {
+    return DownloadProgress{
+        .total_bytes = 0,
+        .downloaded_bytes = 0,
+        .speed_bytes_per_sec = 0,
+        .eta_seconds = 0,
+        .percentage = 0.0f,
+    };
+  }
+
   DownloadProgress dp;
   dp.total_bytes = job->GetTotalSize();
   dp.downloaded_bytes = job->GetReceivedSize();
@@ -109,6 +123,9 @@ DownloadProgress DownloadHandler::GetProgress() const {
 
 std::vector<ChunkProgress> DownloadHandler::GetChunksProgress() const {
   auto job = job_.lock();
+  if (!job) {
+    return {};
+  }
   std::vector<ChunkProgress> chunks_info;
   chunks_info.reserve(job->GetNumChunks());
 
@@ -123,7 +140,15 @@ std::vector<ChunkProgress> DownloadHandler::GetChunksProgress() const {
 }
 
 const MuldError& DownloadHandler::GetError() const {
-  return job_.lock()->GetError();
+  auto job = job_.lock();
+  if (!job) {
+    static const MuldError kInvalidJobError = {
+        .code = ErrorCode::NotInitialized,
+        .detail = "Handler references an invalid or expired job",
+    };
+    return kInvalidJobError;
+  }
+  return job->GetError();
 }
 
 }  // namespace muld
