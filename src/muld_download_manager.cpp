@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 
 #include "downloader.h"
 #include "url.h"
@@ -73,6 +74,9 @@ MuldDownloadManager::~MuldDownloadManager() = default;
 
 MuldDownloadManager::MuldDownloadManager(const MuldConfig& config)
     : logger_(config.logger),
+      jobs_(),
+      jobs_index_(),
+      loaded_images_(),
       threadpool_(std::make_unique<ThreadPool>(
           config.max_threads,
           [](const Task& task) { NetDownloader::DownloadWorker(task); })) {}
@@ -85,7 +89,23 @@ void MuldDownloadManager::EnqueueTasks(DownloadJob* job, int num_connections) {
 
 DownloaderResp MuldDownloadManager::Download(
     const MuldRequest& request, const DownloadCallbacks& callbacks) {
-  Url parsed_url = ParseUrl(request.url);
+  if (!request.url || !request.destination) {
+    return {{.code = ErrorCode::InvalidRequest,
+             .detail = "URL and destination must not be null"},
+            {}};
+  }
+  if (request.max_connections <= 0) {
+    return {{.code = ErrorCode::InvalidRequest,
+             .detail = "max_connections must be greater than zero"},
+            {}};
+  }
+
+  Url parsed_url;
+  try {
+    parsed_url = ParseUrl(request.url);
+  } catch (const std::exception& e) {
+    return {{.code = ErrorCode::InvalidRequest, .detail = e.what()}, {}};
+  }
 
   FetchResult fetch_res;
   for (int redirect_count = 0; redirect_count < MAX_REDIRECT_ALLOW;
@@ -178,13 +198,28 @@ DownloaderResp MuldDownloadManager::Download(
                                 actual_chunk_size);
   }
 
-  auto job = std::make_shared<DownloadJob>(
-      parsed_url, request.destination, request.max_connections, info.total_size,
-      info.supports_range, n_chunks,
-      [this](DownloadJob* job) {
-        this->EnqueueTasks(job, job->maxConnections_);
-      },
-      callbacks);
+  std::shared_ptr<DownloadJob> job;
+  try {
+    job = std::make_shared<DownloadJob>(
+        parsed_url, request.destination, request.max_connections, info.total_size,
+        info.supports_range, n_chunks,
+        [this](DownloadJob* job) {
+          this->EnqueueTasks(job, job->maxConnections_);
+        },
+        callbacks);
+  } catch (const std::system_error& e) {
+    if (logger_) {
+      logger_(LogLevel::Error,
+              std::string("Failed to initialize destination file: ") + e.what());
+    }
+    return {{.code = ErrorCode::DiskWriteFailed, .detail = e.what()}, {}};
+  } catch (const std::exception& e) {
+    if (logger_) {
+      logger_(LogLevel::Error,
+              std::string("Failed to initialize download job: ") + e.what());
+    }
+    return {{.code = ErrorCode::SystemError, .detail = e.what()}, {}};
+  }
 
   jobs_.push_back(job);
   jobs_index_[job->GetIdentityKey()] = job;
@@ -192,7 +227,6 @@ DownloaderResp MuldDownloadManager::Download(
   job->SetValidators(info.etag, info.last_modified);
   job->Start();
 
-  auto handler = DownloadHandler(job);
   return {job->GetError(), DownloadHandler(job)};
 }
 
@@ -228,7 +262,14 @@ DownloaderResp MuldDownloadManager::Load(const std::string& path,
   }
 
   Url corrected_url;
-  auto info = ResolveValidatedFileInfo(ParseUrl(img.url), corrected_url);
+  std::optional<FileInfo> info;
+  try {
+    info = ResolveValidatedFileInfo(ParseUrl(img.url), corrected_url);
+  } catch (const std::exception& e) {
+    loaded_images_.erase(path);
+    return {MuldError{.code = ErrorCode::InvalidRequest, .detail = e.what()},
+            {}};
+  }
   if (!info.has_value()) {
     loaded_images_.erase(path);
     return {MuldError{.code = ErrorCode::FetchFileInfoFailed,

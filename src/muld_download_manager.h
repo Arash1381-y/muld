@@ -47,10 +47,10 @@ class MuldDownloadManager {
 
  private:
   LogCallback logger_;
-  std::unique_ptr<ThreadPool> threadpool_;
   std::vector<std::shared_ptr<DownloadJob>> jobs_;
   std::unordered_map<std::string, std::weak_ptr<DownloadJob>> jobs_index_;
   std::unordered_set<std::string> loaded_images_;
+  std::unique_ptr<ThreadPool> threadpool_;
 };
 
 }  // namespace muld
