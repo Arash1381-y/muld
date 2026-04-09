@@ -28,6 +28,7 @@ struct DownloadHandler::SharedState {
 
   std::atomic<DownloadState> state{DownloadState::Initialized};
   std::atomic<DownloadState> desired_state{DownloadState::Initialized};
+  std::atomic<size_t> desired_speed_limit_bps{0};
   MuldError error;
 
   std::shared_ptr<DownloadEngine> engine;
@@ -131,9 +132,11 @@ void DownloadHandler::AttachEngine(std::shared_ptr<DownloadEngine> engine) {
 
   DownloadState desired = shared_->state.load();
   desired = shared_->desired_state.load();
+  size_t desired_speed_limit_bps = shared_->desired_speed_limit_bps.load();
   {
     std::lock_guard<std::mutex> lock(shared_->mtx);
     shared_->engine = std::move(engine);
+    shared_->engine->SetSpeedLimit(desired_speed_limit_bps);
     shared_->url = shared_->engine->GetUrl();
     shared_->progress.total_bytes = shared_->engine->GetTotalSize();
     shared_->chunks.clear();
@@ -258,6 +261,30 @@ size_t DownloadHandler::GetDownloadSpeed() const {
 size_t DownloadHandler::GetJobEta() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->progress.eta_seconds;
+}
+
+void DownloadHandler::SetSpeedLimit(size_t speed_limit_bps) {
+  std::shared_ptr<DownloadEngine> engine;
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    shared_->desired_speed_limit_bps.store(speed_limit_bps);
+    engine = shared_->engine;
+  }
+  if (engine) {
+    engine->SetSpeedLimit(speed_limit_bps);
+  }
+}
+
+size_t DownloadHandler::GetSpeedLimit() const {
+  std::shared_ptr<DownloadEngine> engine;
+  {
+    std::lock_guard<std::mutex> lock(shared_->mtx);
+    engine = shared_->engine;
+    if (!engine) {
+      return shared_->desired_speed_limit_bps.load();
+    }
+  }
+  return engine->GetSpeedLimit();
 }
 
 DownloadProgress DownloadHandler::GetProgress() const {

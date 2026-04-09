@@ -196,6 +196,82 @@ size_t DownloadEngine::GetDownloadSpeed() const {
 
 size_t DownloadEngine::GetJobEta() const { return eta_.load(); };
 
+void DownloadEngine::RefillRateTokens(std::chrono::steady_clock::time_point now) {
+  size_t limit = speedLimitBps_.load();
+  if (limit == 0) {
+    rateTokens_ = 0.0;
+    rateLastRefill_ = now;
+    return;
+  }
+
+  double dt = std::chrono::duration<double>(now - rateLastRefill_).count();
+  if (dt > 0.0) {
+    rateTokens_ += static_cast<double>(limit) * dt;
+    const double max_burst = std::max(
+        32768.0, static_cast<double>(limit) * 0.20);  // up to 200ms burst
+    if (rateTokens_ > max_burst) {
+      rateTokens_ = max_burst;
+    }
+    rateLastRefill_ = now;
+  }
+}
+
+void DownloadEngine::SetSpeedLimit(size_t speed_limit_bps) {
+  speedLimitBps_.store(speed_limit_bps);
+  {
+    std::lock_guard<std::mutex> lock(rate_mtx_);
+    rateLastRefill_ = std::chrono::steady_clock::now();
+    if (speed_limit_bps == 0) {
+      rateTokens_ = 0.0;
+    } else {
+      const double max_burst = std::max(
+          32768.0, static_cast<double>(speed_limit_bps) * 0.20);
+      if (rateTokens_ > max_burst) {
+        rateTokens_ = max_burst;
+      }
+    }
+  }
+  rate_cv_.notify_all();
+}
+
+size_t DownloadEngine::GetSpeedLimit() const { return speedLimitBps_.load(); }
+
+size_t DownloadEngine::AcquireReadBudget(size_t requested_bytes) {
+  const size_t limit = speedLimitBps_.load();
+  if (limit == 0 || requested_bytes == 0) {
+    return requested_bytes;
+  }
+
+  std::unique_lock<std::mutex> lock(rate_mtx_);
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    RefillRateTokens(now);
+
+    if (rateTokens_ >= 1.0) {
+      size_t allowed =
+          std::min(requested_bytes, static_cast<size_t>(rateTokens_));
+      if (allowed == 0) {
+        allowed = 1;
+      }
+      rateTokens_ -= static_cast<double>(allowed);
+      return allowed;
+    }
+
+    if (GetState() != DownloadState::Downloading) {
+      return 0;
+    }
+
+    double seconds_to_one = (1.0 - rateTokens_) / static_cast<double>(limit);
+    if (seconds_to_one < 0.001) {
+      seconds_to_one = 0.001;
+    }
+    auto wake_time =
+        now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::duration<double>(seconds_to_one));
+    rate_cv_.wait_until(lock, wake_time);
+  }
+}
+
 void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
   auto& chunk = chunksInfo_.at(chunk_id);
   chunk.UpdateReceived(bytes);
@@ -391,6 +467,7 @@ bool DownloadEngine::Resume() {
 
 bool DownloadEngine::Pause() {
   if (!SetState(DownloadState::Paused)) return false;
+  rate_cv_.notify_all();
 
   // Wake up any threads waiting on conditions
   std::lock_guard<std::mutex> wait_lock(wait_mtx_);
@@ -401,6 +478,7 @@ bool DownloadEngine::Pause() {
 
 bool DownloadEngine::Cancel() {
   if (!SetState(DownloadState::Canceled)) return false;
+  rate_cv_.notify_all();
 
   if (nConnections_.load() == 0) {
     CleanupArtifacts(true);
@@ -418,6 +496,7 @@ bool DownloadEngine::Cancel() {
 void DownloadEngine::Fail(ErrorCode code, const std::string& detail,
                           int http_status) {
   if (!SetState(DownloadState::Failed)) return;
+  rate_cv_.notify_all();
 
   {
     // write to disk the current progress
@@ -501,6 +580,7 @@ bool DownloadEngine::SetState(DownloadState next_state) {
   }
 
   if (state_changed) {
+    rate_cv_.notify_all();
     std::function<void(DownloadState)> on_state_change_cb;
     {
       std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);

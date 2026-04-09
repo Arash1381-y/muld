@@ -124,19 +124,24 @@ bool StreamBodyToDisk(T& stream, beast::flat_buffer& buffer,
   char body_buffer[BUFFER_SIZE];
 
   while (!parser.is_done()) {
-    parser.get().body().data = body_buffer;
-    parser.get().body().size = BUFFER_SIZE;
-
     // we only check the state before doing the read. after that
     // no matter what we write on disk and notify the job
     if (job->GetState() != DownloadState::Downloading) {
       return false;
     }
 
+    const size_t allowed_bytes = job->AcquireReadBudget(BUFFER_SIZE);
+    if (allowed_bytes == 0) {
+      return false;
+    }
+
+    parser.get().body().data = body_buffer;
+    parser.get().body().size = allowed_bytes;
+
     beast::error_code ec;
     http::read(stream, buffer, parser, ec);
 
-    std::size_t bytes_read = BUFFER_SIZE - parser.get().body().size;
+    std::size_t bytes_read = allowed_bytes - parser.get().body().size;
     if (bytes_read > 0) {
       size_t bytes_write = 0;
       while (bytes_write < bytes_read) {

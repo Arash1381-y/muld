@@ -191,6 +191,8 @@ class DownloadHandler {
   size_t GetReceivedSize() const;
   size_t GetDownloadSpeed() const;
   size_t GetJobEta() const;
+  void SetSpeedLimit(size_t speed_limit_bps);
+  size_t GetSpeedLimit() const;
   DownloadProgress GetProgress() const;
   std::vector<ChunkProgress> GetChunksProgress() const;
   bool IsFinished() const;
@@ -219,6 +221,7 @@ struct MuldRequest {
   const char* url;
   const char* destination;
   int max_connections;
+  std::size_t speed_limit_bps = 0;  // 0 means unlimited
 };
 
 struct DownloaderResp {
@@ -250,6 +253,7 @@ class MuldDownloadManager {
     Url url;
     std::string destination;
     int max_connections = 1;
+    std::size_t speed_limit_bps = 0;
     std::string image_path;
     DownloadCallbacks callbacks;
     DownloadHandler handler;

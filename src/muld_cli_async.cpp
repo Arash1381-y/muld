@@ -3,9 +3,11 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <unordered_map>
 
 using namespace std;
@@ -15,10 +17,80 @@ void PrintHelp() {
   cout << "Usage: muld [OPTIONS] <URL>\n"
        << "  -o, --output <f>    Output file path (default: extracted)\n"
        << "  -c, --conn <N>      Concurrent connections (default: 8)\n"
+       << "  -s, --speed <RATE>  Speed limit, e.g. 20MB/s, 20M, 20K (default: unlimited)\n"
        << "  -h, --help          Show this help message\n";
 }
 
-bool parseArgs(int argc, char** argv, string& url, string& out, int& conn) {
+bool ParseSpeedLimit(const string& input, size_t& out_bps) {
+  string s;
+  s.reserve(input.size());
+  for (char ch : input) {
+    if (!isspace(static_cast<unsigned char>(ch))) {
+      s.push_back(static_cast<char>(toupper(static_cast<unsigned char>(ch))));
+    }
+  }
+  if (s.empty()) return false;
+
+  size_t i = 0;
+  bool dot_seen = false;
+  while (i < s.size()) {
+    char ch = s[i];
+    if (isdigit(static_cast<unsigned char>(ch))) {
+      ++i;
+      continue;
+    }
+    if (ch == '.' && !dot_seen) {
+      dot_seen = true;
+      ++i;
+      continue;
+    }
+    break;
+  }
+
+  if (i == 0) return false;
+
+  double value = 0.0;
+  try {
+    value = stod(s.substr(0, i));
+  } catch (...) {
+    return false;
+  }
+  if (!isfinite(value) || value < 0.0) return false;
+
+  string unit = s.substr(i);
+  if (unit.size() >= 2 && unit.compare(unit.size() - 2, 2, "/S") == 0) {
+    unit.erase(unit.size() - 2);
+  }
+  if (unit == "PS") unit.clear();
+  if (unit == "BPS") unit = "B";
+
+  size_t multiplier = 1;
+  if (unit.empty() || unit == "B") {
+    multiplier = 1;
+  } else if (unit == "K" || unit == "KB" || unit == "KI" || unit == "KIB") {
+    multiplier = 1024ULL;
+  } else if (unit == "M" || unit == "MB" || unit == "MI" || unit == "MIB") {
+    multiplier = 1024ULL * 1024ULL;
+  } else if (unit == "G" || unit == "GB" || unit == "GI" || unit == "GIB") {
+    multiplier = 1024ULL * 1024ULL * 1024ULL;
+  } else if (unit == "T" || unit == "TB" || unit == "TI" || unit == "TIB") {
+    multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+  } else {
+    return false;
+  }
+
+  long double scaled = static_cast<long double>(value) * multiplier;
+  if (scaled < 0.0L ||
+      scaled > static_cast<long double>(numeric_limits<size_t>::max())) {
+    return false;
+  }
+
+  out_bps = static_cast<size_t>(scaled);
+  return true;
+}
+
+bool parseArgs(int argc, char** argv, string& url, string& out, int& conn,
+               size_t& speed_limit_bps) {
   for (int i = 1; i < argc; ++i) {
     string a = argv[i];
     if (a == "-h" || a == "--help") return PrintHelp(), false;
@@ -32,6 +104,14 @@ bool parseArgs(int argc, char** argv, string& url, string& out, int& conn) {
         conn = stoi(argv[i]);
       else
         return cerr << "Missing -c arg\n", false;
+    } else if (a == "-s" || a == "--speed") {
+      if (++i < argc) {
+        if (!ParseSpeedLimit(argv[i], speed_limit_bps)) {
+          return cerr << "Invalid speed format: " << argv[i] << "\n", false;
+        }
+      } else {
+        return cerr << "Missing -s arg\n", false;
+      }
     } else if (a[0] == '-')
       return cerr << "Unknown option: " << a << "\n", false;
     else
@@ -94,7 +174,8 @@ auto cli_logger = [](LogLevel l, const string& msg) {
 int main(int argc, char* argv[]) {
   string url, out;
   int conn = 8;
-  if (!parseArgs(argc, argv, url, out, conn)) return 1;
+  size_t speed_limit_bps = 0;
+  if (!parseArgs(argc, argv, url, out, conn, speed_limit_bps)) return 1;
   if (url.empty()) return cerr << "Error: No URL provided.\n", PrintHelp(), 1;
   if (out.empty()) out = ExtractFilenameFromUrl(url);
 
@@ -115,10 +196,12 @@ int main(int argc, char* argv[]) {
 
   MuldDownloadManager mgr({conn, cli_logger});
   cout << "Starting download...\nURL:  " << url << "\nDest: " << out
-       << "\nConn: " << conn << "\n\n";
+       << "\nConn: " << conn << "\nSpeed: "
+       << (speed_limit_bps == 0 ? "unlimited" : std::to_string(speed_limit_bps) + " B/s")
+       << "\n\n";
 
   auto [err, task] =
-      mgr.Download({url.c_str(), out.c_str(), conn},
+      mgr.Download({url.c_str(), out.c_str(), conn, speed_limit_bps},
                    {.on_progress =
                         [&](const auto& p) {
                           d_prog = p;

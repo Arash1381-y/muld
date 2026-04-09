@@ -124,6 +124,7 @@ DownloaderResp MuldDownloadManager::Download(
 
   DownloadHandler task(parsed_url, request.destination, callbacks);
   task.Resume();
+  task.SetSpeedLimit(request.speed_limit_bps);
   {
     std::lock_guard<std::mutex> lock(pending_mtx_);
     pending_requests_.push(PendingDownloadRequest{
@@ -131,6 +132,7 @@ DownloaderResp MuldDownloadManager::Download(
         .url = parsed_url,
         .destination = request.destination,
         .max_connections = request.max_connections,
+        .speed_limit_bps = request.speed_limit_bps,
         .image_path = {},
         .callbacks = callbacks,
         .handler = task,
@@ -187,6 +189,7 @@ DownloaderResp MuldDownloadManager::Load(const std::string& path,
         .url = Url{},
         .destination = {},
         .max_connections = 1,
+        .speed_limit_bps = 0,
         .image_path = path,
         .callbacks = callbacks,
         .handler = task,
@@ -380,6 +383,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
           [this](DownloadEngine* engine) {
             this->EnqueueTasks(engine, engine->maxConnections_);
           });
+      job->SetSpeedLimit(pending->speed_limit_bps);
     } catch (const std::system_error& e) {
       pending->handler.FailBeforeEngineStart(ErrorCode::DiskWriteFailed, e.what());
       continue;

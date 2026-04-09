@@ -69,6 +69,9 @@ class DownloadEngine {
   size_t GetReceivedSize() const;
   size_t GetDownloadSpeed() const;
   size_t GetJobEta() const;
+  void SetSpeedLimit(size_t speed_limit_bps);
+  size_t GetSpeedLimit() const;
+  size_t AcquireReadBudget(size_t requested_bytes);
 
   size_t GetNumChunks() const;
   DownloadState GetState() const;
@@ -93,6 +96,7 @@ class DownloadEngine {
 
   bool NeedsStore() const;
   void BuildPendingWork();
+  void RefillRateTokens(std::chrono::steady_clock::time_point now);
 
   std::atomic<DownloadState> state_;
   bool ranged_;
@@ -132,6 +136,13 @@ class DownloadEngine {
   std::atomic<int> nConnections_;  // active connections (threads)
   std::mutex wait_mtx_, error_mtx_, disk_mtx_, speed_mtx_, callbacks_mtx_;
   std::condition_variable wait_cv_;
+
+  std::atomic<size_t> speedLimitBps_{0};
+  double rateTokens_ = 0.0;
+  std::chrono::steady_clock::time_point rateLastRefill_{
+      std::chrono::steady_clock::now()};
+  mutable std::mutex rate_mtx_;
+  std::condition_variable rate_cv_;
 
   std::function<void(DownloadEngine*)> start_download_;
 
