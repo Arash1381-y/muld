@@ -166,11 +166,11 @@ struct ChunkProgress {
   std::size_t total_bytes;
 };
 
-class DownloadTask {
+class DownloadHandler {
  public:
-  DownloadTask(const Url& url, const std::string& output_path,
+  DownloadHandler(const Url& url, const std::string& output_path,
                const DownloadCallbacks& callbacks = {});
-  ~DownloadTask() = default;
+  ~DownloadHandler() = default;
 
   void AttachEngine(std::shared_ptr<DownloadEngine> engine);
   void FailBeforeEngineStart(ErrorCode code, const std::string& detail);
@@ -223,7 +223,7 @@ struct MuldRequest {
 
 struct DownloaderResp {
   MuldError error;
-  std::optional<DownloadTask> task;
+  std::optional<DownloadHandler> handler;
 
   bool ok() const { return error.code == ErrorCode::Ok; }
   operator bool() const { return ok(); }
@@ -252,7 +252,7 @@ class MuldDownloadManager {
     int max_connections = 1;
     std::string image_path;
     DownloadCallbacks callbacks;
-    DownloadTask task;
+    DownloadHandler handler;
   };
 
   void DownloadDispatcherLoop();
@@ -270,7 +270,7 @@ class MuldDownloadManager {
   std::mutex pending_mtx_;
   std::condition_variable pending_cv_;
   bool stop_dispatcher_ = false;
-  std::vector<DownloadTask> tasks_;
+  std::vector<DownloadHandler> handler_;
 };
 
 ///////////////////////////////////////

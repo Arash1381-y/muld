@@ -89,6 +89,7 @@ class DownloadEngine {
  private:
   bool SetState(DownloadState state);
   void StoreUnlocked();
+  void CleanupArtifacts(bool remove_output_file);
 
   bool NeedsStore() const;
   void BuildPendingWork();
@@ -109,6 +110,7 @@ class DownloadEngine {
   std::uint64_t updatedAt_ = 0;
   JobImageIndex imageIndex_;
   bool imageStored_ = false;
+  bool artifactsCleaned_ = false;
 
   size_t nChunks_;
   size_t

@@ -15,7 +15,7 @@ bool IsTerminalState(DownloadState state) {
 }
 }  // namespace
 
-struct DownloadTask::SharedState {
+struct DownloadHandler::SharedState {
   explicit SharedState(const Url& in_url, std::string in_output,
                        DownloadCallbacks in_callbacks)
       : url(in_url),
@@ -44,17 +44,17 @@ struct DownloadTask::SharedState {
   std::vector<ChunkProgress> chunks;
 };
 
-DownloadTask::DownloadTask(const Url& url, const std::string& output_path,
+DownloadHandler::DownloadHandler(const Url& url, const std::string& output_path,
                            const DownloadCallbacks& callbacks)
     : shared_(
           std::make_shared<SharedState>(url, std::string(output_path), callbacks)) {}
 
-void DownloadTask::AttachHandlerCallbacks(const DownloadCallbacks& callbacks) {
+void DownloadHandler::AttachHandlerCallbacks(const DownloadCallbacks& callbacks) {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   shared_->callbacks = callbacks;
 }
 
-void DownloadTask::AttachEngine(std::shared_ptr<DownloadEngine> engine) {
+void DownloadHandler::AttachEngine(std::shared_ptr<DownloadEngine> engine) {
   if (!engine) return;
 
   std::weak_ptr<SharedState> weak_shared = shared_;
@@ -154,7 +154,7 @@ void DownloadTask::AttachEngine(std::shared_ptr<DownloadEngine> engine) {
   }
 }
 
-void DownloadTask::FailBeforeEngineStart(ErrorCode code,
+void DownloadHandler::FailBeforeEngineStart(ErrorCode code,
                                          const std::string& detail) {
   std::function<void(MuldError)> cb;
   MuldError err = {.code = code, .detail = detail};
@@ -169,7 +169,7 @@ void DownloadTask::FailBeforeEngineStart(ErrorCode code,
   shared_->wait_cv.notify_all();
 }
 
-void DownloadTask::Pause() {
+void DownloadHandler::Pause() {
   std::shared_ptr<DownloadEngine> engine;
   {
     std::lock_guard<std::mutex> lock(shared_->mtx);
@@ -183,7 +183,7 @@ void DownloadTask::Pause() {
   engine->Pause();
 }
 
-void DownloadTask::Resume() {
+void DownloadHandler::Resume() {
   std::shared_ptr<DownloadEngine> engine;
   {
     std::lock_guard<std::mutex> lock(shared_->mtx);
@@ -197,7 +197,7 @@ void DownloadTask::Resume() {
   engine->Resume();
 }
 
-void DownloadTask::Cancel() {
+void DownloadHandler::Cancel() {
   std::shared_ptr<DownloadEngine> engine;
   {
     std::lock_guard<std::mutex> lock(shared_->mtx);
@@ -212,7 +212,7 @@ void DownloadTask::Cancel() {
   engine->Cancel();
 }
 
-void DownloadTask::WaitUntilFinished() {
+void DownloadHandler::WaitUntilFinished() {
   std::shared_ptr<DownloadEngine> engine;
   {
     std::unique_lock<std::mutex> lock(shared_->mtx);
@@ -227,11 +227,11 @@ void DownloadTask::WaitUntilFinished() {
   }
 }
 
-DownloadState DownloadTask::GetState() const { return shared_->state.load(); }
+DownloadState DownloadHandler::GetState() const { return shared_->state.load(); }
 
-const Url& DownloadTask::GetUrl() const { return shared_->url; }
+const Url& DownloadHandler::GetUrl() const { return shared_->url; }
 
-const MuldError& DownloadTask::GetError() const {
+const MuldError& DownloadHandler::GetError() const {
   thread_local MuldError snapshot;
   {
     std::lock_guard<std::mutex> lock(shared_->mtx);
@@ -240,41 +240,41 @@ const MuldError& DownloadTask::GetError() const {
   return snapshot;
 }
 
-size_t DownloadTask::GetTotalSize() const {
+size_t DownloadHandler::GetTotalSize() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->progress.total_bytes;
 }
 
-size_t DownloadTask::GetReceivedSize() const {
+size_t DownloadHandler::GetReceivedSize() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->progress.downloaded_bytes;
 }
 
-size_t DownloadTask::GetDownloadSpeed() const {
+size_t DownloadHandler::GetDownloadSpeed() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->progress.speed_bytes_per_sec;
 }
 
-size_t DownloadTask::GetJobEta() const {
+size_t DownloadHandler::GetJobEta() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->progress.eta_seconds;
 }
 
-DownloadProgress DownloadTask::GetProgress() const {
+DownloadProgress DownloadHandler::GetProgress() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->progress;
 }
 
-std::vector<ChunkProgress> DownloadTask::GetChunksProgress() const {
+std::vector<ChunkProgress> DownloadHandler::GetChunksProgress() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->chunks;
 }
 
-bool DownloadTask::IsFinished() const {
+bool DownloadHandler::IsFinished() const {
   return IsTerminalState(shared_->state.load());
 }
 
-bool DownloadTask::HasError() const {
+bool DownloadHandler::HasError() const {
   std::lock_guard<std::mutex> lock(shared_->mtx);
   return shared_->error.code != ErrorCode::Ok;
 }

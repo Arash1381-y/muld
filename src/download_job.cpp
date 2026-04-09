@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <utility>
 #include <vector>
 
@@ -22,11 +23,11 @@ std::uint64_t GetUnixTimestamp() {
 }
 }  // namespace
 
-DownloadEngine::DownloadEngine(const Url& url, const std::string& output_path,
-                         int max_connections, size_t file_size, bool ranged,
-                         size_t n_chunks,
-                         std::function<void(DownloadEngine*)> start_download,
-                         const DownloadCallbacks& callbacks)
+DownloadEngine::DownloadEngine(
+    const Url& url, const std::string& output_path, int max_connections,
+    size_t file_size, bool ranged, size_t n_chunks,
+    std::function<void(DownloadEngine*)> start_download,
+    const DownloadCallbacks& callbacks)
     : maxConnections_(max_connections),
       ranged_(ranged),
       url_(url),
@@ -35,8 +36,8 @@ DownloadEngine::DownloadEngine(const Url& url, const std::string& output_path,
       nTotalReceivedBytes_(0),
       nChunks_(n_chunks),
       nReceivedBytesFromLastStore_(0),
-      nextWorkItem_(0),
       nDownloadedChunks_(0),
+      nextWorkItem_(0),
       lastSpeedCalcTime_(std::chrono::steady_clock::now()),
       lastProgressCallbackTime_(std::chrono::steady_clock::now()),
       nBytesFromLastSpeedCalc_(0),
@@ -67,16 +68,16 @@ DownloadEngine::DownloadEngine(const Url& url, const std::string& output_path,
   }
 }
 
-DownloadEngine::DownloadEngine(const JobImage& image,
-                         std::function<void(DownloadEngine*)> start_download,
-                         const DownloadCallbacks& callbacks)
-    : lastSpeedCalcTime_(std::chrono::steady_clock::now()),
+DownloadEngine::DownloadEngine(
+    const JobImage& image, std::function<void(DownloadEngine*)> start_download,
+    const DownloadCallbacks& callbacks)
+    : nextWorkItem_(0),
+      lastSpeedCalcTime_(std::chrono::steady_clock::now()),
       lastProgressCallbackTime_(std::chrono::steady_clock::now()),
       nBytesFromLastSpeedCalc_(0),
       downloadSpeed_(0),  // (bytes / per sec)
       eta_(0),            // download job eta
       nConnections_(0),
-      nextWorkItem_(0),
       callbacks_(callbacks) {
   state_ = DownloadState::Initialized;
   url_ = ParseUrl(image.url);
@@ -116,7 +117,7 @@ DownloadEngine::DownloadEngine(const JobImage& image,
 }
 
 void DownloadEngine::SetValidators(const std::string& etag,
-                                const std::string& last_modified) {
+                                   const std::string& last_modified) {
   etag_ = etag;
   lastModified_ = last_modified;
 }
@@ -142,7 +143,14 @@ void DownloadEngine::NotifyConnectionOpen() {
   }
 }
 
-void DownloadEngine::NotifyConnectionClose() { nConnections_.fetch_sub(1); }
+void DownloadEngine::NotifyConnectionClose() {
+  int remaining = nConnections_.fetch_sub(1) - 1;
+  if (remaining == 0 && state_.load() == DownloadState::Canceled) {
+    CleanupArtifacts(true);
+    std::lock_guard<std::mutex> wait_lock(wait_mtx_);
+    wait_cv_.notify_all();
+  }
+}
 
 // used for redirection
 void DownloadEngine::SetUrl(const Url& url) { url_ = url; }
@@ -182,7 +190,9 @@ size_t DownloadEngine::GetReceivedSize() const {
   return nTotalReceivedBytes_.load();
 };
 
-size_t DownloadEngine::GetDownloadSpeed() const { return downloadSpeed_.load(); };
+size_t DownloadEngine::GetDownloadSpeed() const {
+  return downloadSpeed_.load();
+};
 
 size_t DownloadEngine::GetJobEta() const { return eta_.load(); };
 
@@ -238,11 +248,9 @@ void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
     dp.downloaded_bytes = nTotalReceivedBytes_.load();
     dp.speed_bytes_per_sec = static_cast<size_t>(downloadSpeed_.load());
     dp.eta_seconds = static_cast<size_t>(eta_.load());
-    dp.percentage =
-        fileSize_ > 0
-            ? static_cast<float>(dp.downloaded_bytes) /
-                  static_cast<float>(fileSize_) * 100.0f
-            : 0.0f;
+    dp.percentage = fileSize_ > 0 ? static_cast<float>(dp.downloaded_bytes) /
+                                        static_cast<float>(fileSize_) * 100.0f
+                                  : 0.0f;
     std::function<void(const DownloadProgress&)> on_progress_cb;
     {
       std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
@@ -272,6 +280,7 @@ void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
       auto expected = DownloadState::Downloading;
       if (state_.compare_exchange_strong(expected, DownloadState::Completed)) {
         Store();
+        CleanupArtifacts(false);
         std::function<void()> on_finish_cb;
         {
           std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
@@ -286,6 +295,7 @@ void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
                  expected == DownloadState::Failed) {
         state_.store(DownloadState::Completed);
         Store();
+        CleanupArtifacts(false);
         std::function<void()> on_finish_cb;
         {
           std::lock_guard<std::mutex> cb_lock(callbacks_mtx_);
@@ -392,6 +402,10 @@ bool DownloadEngine::Pause() {
 bool DownloadEngine::Cancel() {
   if (!SetState(DownloadState::Canceled)) return false;
 
+  if (nConnections_.load() == 0) {
+    CleanupArtifacts(true);
+  }
+
   // Wake up any threads waiting on conditions
   std::lock_guard<std::mutex> wait_lock(wait_mtx_);
   wait_cv_.notify_all();
@@ -402,7 +416,7 @@ bool DownloadEngine::Cancel() {
 }
 
 void DownloadEngine::Fail(ErrorCode code, const std::string& detail,
-                       int http_status) {
+                          int http_status) {
   if (!SetState(DownloadState::Failed)) return;
 
   {
@@ -431,7 +445,6 @@ void DownloadEngine::Fail(ErrorCode code, const std::string& detail,
     on_error_cb(error_);
   }
 }
-
 
 bool DownloadEngine::SetState(DownloadState next_state) {
   bool state_changed = false;
@@ -507,6 +520,25 @@ DownloadState DownloadEngine::GetState() const { return state_.load(); }
 void DownloadEngine::Store() {
   std::lock_guard<std::mutex> disk_lock(disk_mtx_);
   StoreUnlocked();
+}
+
+void DownloadEngine::CleanupArtifacts(bool remove_output_file) {
+  std::lock_guard<std::mutex> disk_lock(disk_mtx_);
+  if (artifactsCleaned_) return;
+
+  // Close file descriptor before delete, needed for reliable behavior on
+  // platforms that do not allow unlinking open files.
+  writer_.reset();
+
+  const std::string image_path = outputPath_ + ".muld";
+  std::error_code ec;
+  std::filesystem::remove(image_path, ec);
+
+  if (remove_output_file) {
+    std::filesystem::remove(outputPath_, ec);
+  }
+
+  artifactsCleaned_ = true;
 }
 
 void DownloadEngine::StoreUnlocked() {

@@ -122,7 +122,7 @@ DownloaderResp MuldDownloadManager::Download(
     return {{.code = ErrorCode::InvalidRequest, .detail = e.what()}, {}};
   }
 
-  DownloadTask task(parsed_url, request.destination, callbacks);
+  DownloadHandler task(parsed_url, request.destination, callbacks);
   task.Resume();
   {
     std::lock_guard<std::mutex> lock(pending_mtx_);
@@ -133,12 +133,12 @@ DownloaderResp MuldDownloadManager::Download(
         .max_connections = request.max_connections,
         .image_path = {},
         .callbacks = callbacks,
-        .task = task,
+        .handler = task,
     });
   }
   {
     std::lock_guard<std::mutex> lock(jobs_mtx_);
-    tasks_.push_back(task);
+    handler_.push_back(task);
   }
   pending_cv_.notify_one();
 
@@ -146,10 +146,10 @@ DownloaderResp MuldDownloadManager::Download(
 }
 
 void MuldDownloadManager::WaitAll() {
-  std::vector<DownloadTask> local_tasks;
+  std::vector<DownloadHandler> local_tasks;
   {
     std::lock_guard<std::mutex> lock(jobs_mtx_);
-    local_tasks = tasks_;
+    local_tasks = handler_;
   }
   for (auto& task : local_tasks) {
     task.WaitUntilFinished();
@@ -179,7 +179,7 @@ DownloaderResp MuldDownloadManager::Load(const std::string& path,
             {}};
   }
 
-  DownloadTask task(Url{}, path, callbacks);
+  DownloadHandler task(Url{}, path, callbacks);
   {
     std::lock_guard<std::mutex> lock(pending_mtx_);
     pending_requests_.push(PendingDownloadRequest{
@@ -189,14 +189,14 @@ DownloaderResp MuldDownloadManager::Load(const std::string& path,
         .max_connections = 1,
         .image_path = path,
         .callbacks = callbacks,
-        .task = task,
+        .handler = task,
     });
   }
   pending_cv_.notify_one();
 
   {
     std::lock_guard<std::mutex> lock(jobs_mtx_);
-    tasks_.push_back(task);
+    handler_.push_back(task);
   }
   return {MuldError(), task};
 }
@@ -223,7 +223,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       const std::string path = pending->image_path;
       JobImage img;
       if (!ReadImageFromDisk(img, path)) {
-        pending->task.FailBeforeEngineStart(ErrorCode::DiskError,
+        pending->handler.FailBeforeEngineStart(ErrorCode::DiskError,
                                             "Can not load download");
         continue;
       }
@@ -231,7 +231,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       {
         std::lock_guard<std::mutex> lock(jobs_mtx_);
         if (!loaded_images_.insert(path).second) {
-          pending->task.FailBeforeEngineStart(ErrorCode::DuplicateJob,
+          pending->handler.FailBeforeEngineStart(ErrorCode::DuplicateJob,
                                               "Job already loaded");
           continue;
         }
@@ -244,14 +244,14 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(jobs_mtx_);
         loaded_images_.erase(path);
-        pending->task.FailBeforeEngineStart(ErrorCode::InvalidRequest, e.what());
+        pending->handler.FailBeforeEngineStart(ErrorCode::InvalidRequest, e.what());
         continue;
       }
 
       if (!info.has_value()) {
         std::lock_guard<std::mutex> lock(jobs_mtx_);
         loaded_images_.erase(path);
-        pending->task.FailBeforeEngineStart(ErrorCode::FetchFileInfoFailed,
+        pending->handler.FailBeforeEngineStart(ErrorCode::FetchFileInfoFailed,
                                             "Failed to fetch URL");
         continue;
       }
@@ -259,7 +259,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       if (!MatchesStoredFile(img, *info)) {
         std::lock_guard<std::mutex> lock(jobs_mtx_);
         loaded_images_.erase(path);
-        pending->task.FailBeforeEngineStart(
+        pending->handler.FailBeforeEngineStart(
             ErrorCode::FetchFileInfoFailed,
             "Attachment does not match with current content");
         continue;
@@ -278,7 +278,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
         auto existing = jobs_index_.find(identity_key);
         if (existing != jobs_index_.end() && !existing->second.expired()) {
           loaded_images_.erase(path);
-          pending->task.FailBeforeEngineStart(
+          pending->handler.FailBeforeEngineStart(
               ErrorCode::FetchFileInfoFailed,
               "Attachment does not match with current content");
           continue;
@@ -288,7 +288,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       if (!std::filesystem::exists(img.file_path)) {
         std::lock_guard<std::mutex> lock(jobs_mtx_);
         loaded_images_.erase(path);
-        pending->task.FailBeforeEngineStart(ErrorCode::DiskError,
+        pending->handler.FailBeforeEngineStart(ErrorCode::DiskError,
                                             "Target file is missing on disk");
         continue;
       }
@@ -297,7 +297,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       if (img.file_size > 0 && local_size != img.file_size) {
         std::lock_guard<std::mutex> lock(jobs_mtx_);
         loaded_images_.erase(path);
-        pending->task.FailBeforeEngineStart(
+        pending->handler.FailBeforeEngineStart(
             ErrorCode::DiskError,
             "Target file size does not match stored job image");
         continue;
@@ -313,7 +313,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
         jobs_.push_back(job);
         jobs_index_[job->GetIdentityKey()] = job;
       }
-      pending->task.AttachEngine(job);
+      pending->handler.AttachEngine(job);
       continue;
     }
 
@@ -345,19 +345,19 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
     }
 
     if (unsupported_scheme) {
-      pending->task.FailBeforeEngineStart(
+      pending->handler.FailBeforeEngineStart(
           ErrorCode::NotSupported,
           parsed_url.scheme + " is not supported!");
       continue;
     }
     if (fetch_res.state == FetchResult::State::REDIRECT) {
-      pending->task.FailBeforeEngineStart(ErrorCode::MaxRedirectsExceeded,
+      pending->handler.FailBeforeEngineStart(ErrorCode::MaxRedirectsExceeded,
                                          "Exceeded max redirects");
       continue;
     }
     if (fetch_res.state != FetchResult::State::SUCCESSFUL) {
       auto err = std::get<FetchError>(fetch_res.data);
-      pending->task.FailBeforeEngineStart(err.error_code, err.message);
+      pending->handler.FailBeforeEngineStart(err.error_code, err.message);
       continue;
     }
 
@@ -381,10 +381,10 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
             this->EnqueueTasks(engine, engine->maxConnections_);
           });
     } catch (const std::system_error& e) {
-      pending->task.FailBeforeEngineStart(ErrorCode::DiskWriteFailed, e.what());
+      pending->handler.FailBeforeEngineStart(ErrorCode::DiskWriteFailed, e.what());
       continue;
     } catch (const std::exception& e) {
-      pending->task.FailBeforeEngineStart(ErrorCode::SystemError, e.what());
+      pending->handler.FailBeforeEngineStart(ErrorCode::SystemError, e.what());
       continue;
     }
 
@@ -394,7 +394,7 @@ void MuldDownloadManager::DownloadDispatcherLoop() {
       jobs_index_[job->GetIdentityKey()] = job;
     }
 
-    pending->task.AttachEngine(job);
+    pending->handler.AttachEngine(job);
     job->SetValidators(info.etag, info.last_modified);
   }
 }
