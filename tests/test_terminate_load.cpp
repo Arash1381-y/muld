@@ -31,7 +31,7 @@ int main(int argc, char* argv[]) {
   {
     std::cout << "--- Starting Terminate/Load Integration Test ---\n";
     MuldConfig config = {10, test_logger};
-    MuldRequest request = {test_url.c_str(), output_file.c_str(), 10};
+    MuldRequest request = {test_url.c_str(), output_file.c_str()};
     MuldDownloadManager manager(config);
 
     std::cout << "[Test] Initiating download...\n";

@@ -1,13 +1,14 @@
 #include <muld/muld.h>
 
-#include <thread>
-#include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <thread>
 #include <unordered_map>
 
 using namespace std;
@@ -16,8 +17,9 @@ using namespace muld;
 void PrintHelp() {
   cout << "Usage: muld [OPTIONS] <URL>\n"
        << "  -o, --output <f>    Output file path (default: extracted)\n"
-       << "  -c, --conn <N>      Concurrent connections (default: 8)\n"
-       << "  -s, --speed <RATE>  Speed limit, e.g. 20MB/s, 20M, 20K (default: unlimited)\n"
+       << "  -c, --threads <N>   Worker thread pool size (default: 8)\n"
+       << "  -s, --speed <RATE>  Speed limit, e.g. 20MB/s, 20M, 20K (default: "
+          "unlimited)\n"
        << "  -h, --help          Show this help message\n";
 }
 
@@ -89,8 +91,8 @@ bool ParseSpeedLimit(const string& input, size_t& out_bps) {
   return true;
 }
 
-bool parseArgs(int argc, char** argv, string& url, string& out, int& conn,
-               size_t& speed_limit_bps) {
+bool parseArgs(int argc, char** argv, string& url, string& out,
+               int& max_threads, size_t& speed_limit_bps) {
   for (int i = 1; i < argc; ++i) {
     string a = argv[i];
     if (a == "-h" || a == "--help") return PrintHelp(), false;
@@ -99,9 +101,9 @@ bool parseArgs(int argc, char** argv, string& url, string& out, int& conn,
         out = argv[i];
       else
         return cerr << "Missing -o arg\n", false;
-    } else if (a == "-c" || a == "--conn") {
+    } else if (a == "-c" || a == "--threads" || a == "--conn") {
       if (++i < argc)
-        conn = stoi(argv[i]);
+        max_threads = stoi(argv[i]);
       else
         return cerr << "Missing -c arg\n", false;
     } else if (a == "-s" || a == "--speed") {
@@ -173,13 +175,14 @@ auto cli_logger = [](LogLevel l, const string& msg) {
 
 int main(int argc, char* argv[]) {
   string url, out;
-  int conn = 8;
+  int max_threads = 8;
   size_t speed_limit_bps = 0;
-  if (!parseArgs(argc, argv, url, out, conn, speed_limit_bps)) return 1;
+  if (!parseArgs(argc, argv, url, out, max_threads, speed_limit_bps)) return 1;
   if (url.empty()) return cerr << "Error: No URL provided.\n", PrintHelp(), 1;
   if (out.empty()) out = ExtractFilenameFromUrl(url);
 
   bool c_mod = false, d_mod = false;
+  size_t average_bandwidth;
   DownloadProgress d_prog;
   vector<ChunkProgress> all;
   unordered_map<int, ChunkProgress> active;
@@ -194,14 +197,16 @@ int main(int argc, char* argv[]) {
     c_mod = true;
   };
 
-  MuldDownloadManager mgr({conn, cli_logger});
+  MuldDownloadManager mgr({max_threads, cli_logger});
   cout << "Starting download...\nURL:  " << url << "\nDest: " << out
-       << "\nConn: " << conn << "\nSpeed: "
-       << (speed_limit_bps == 0 ? "unlimited" : std::to_string(speed_limit_bps) + " B/s")
+       << "\nThreads: " << max_threads << "\nSpeed: "
+       << (speed_limit_bps == 0 ? "unlimited"
+                                : std::to_string(speed_limit_bps) + " B/s")
        << "\n\n";
 
+  auto start = std::chrono::steady_clock::now();
   auto [err, task] =
-      mgr.Download({url.c_str(), out.c_str(), conn, speed_limit_bps},
+      mgr.Download({url.c_str(), out.c_str(), speed_limit_bps},
                    {.on_progress =
                         [&](const auto& p) {
                           d_prog = p;
@@ -237,4 +242,10 @@ int main(int argc, char* argv[]) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
+
+  if (task->HasError()) {
+    exit(EXIT_FAILURE);
+  }
+
+  exit(EXIT_SUCCESS);
 }

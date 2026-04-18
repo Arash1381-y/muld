@@ -27,8 +27,10 @@ find_package(OpenSSL REQUIRED)
 # Explicitly allow users to build as SHARED or STATIC using BUILD_SHARED_LIBS
 add_library(muld STATIC
     src/chunk_info.h
+    src/connection_controller.h
     src/download_handler.h
     src/download_job.h
+    src/connection_controller.cpp
     src/download_job.cpp
     src/downloader.h
     src/error.h
@@ -100,12 +102,17 @@ add_executable(muld_test_chunk_stability_pause_resume
 target_link_libraries(muld_test_chunk_stability_pause_resume PRIVATE muld)
 target_include_directories(muld_test_chunk_stability_pause_resume PRIVATE include)
 
+add_executable(muld_test_connection_controller tests/test_connection_controller.cpp)
+target_link_libraries(muld_test_connection_controller PRIVATE muld)
+target_include_directories(muld_test_connection_controller PRIVATE include)
+
 # Register it with CTest
 add_test(NAME PauseResumeTest COMMAND muld_test_pause_resume)
 add_test(NAME TerminateLoadTest COMMAND muld_test_terminate_load)
 add_test(NAME CallbacksProgressTest COMMAND muld_test_callbacks_progress)
 add_test(NAME AttachCallbacksThreadsafeTest COMMAND muld_test_attach_callbacks_threadsafe)
 add_test(NAME ChunkStabilityPauseResumeTest COMMAND muld_test_chunk_stability_pause_resume)
+add_test(NAME ConnectionControllerTest COMMAND muld_test_connection_controller)
 
 # Install the library, executable, and export the targets
 install(TARGETS muld_cli

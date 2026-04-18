@@ -28,7 +28,7 @@ int main(int argc, char* argv[]) {
   std::cout << "--- Starting Pause/Resume Integration Test ---\n";
 
   MuldConfig config = {8, test_logger};  // 8 connections
-  MuldRequest request = {test_url.c_str(), output_file.c_str(), 4};
+  MuldRequest request = {test_url.c_str(), output_file.c_str()};
   MuldDownloadManager manager(config);
 
   // 1. Start Download

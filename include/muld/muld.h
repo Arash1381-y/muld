@@ -211,6 +211,7 @@ class DownloadHandler {
 ////////// muld downloader ////////////
 ///////////////////////////////////////
 class ThreadPool;
+class ConnectionController;
 
 struct MuldConfig {
   int max_threads = 8;  // maximum threads in thread pool
@@ -220,7 +221,6 @@ struct MuldConfig {
 struct MuldRequest {
   const char* url;
   const char* destination;
-  int max_connections;
   std::size_t speed_limit_bps = 0;  // 0 means unlimited
 };
 
@@ -252,7 +252,6 @@ class MuldDownloadManager {
     Kind kind;
     Url url;
     std::string destination;
-    int max_connections = 1;
     std::size_t speed_limit_bps = 0;
     std::string image_path;
     DownloadCallbacks callbacks;
@@ -260,20 +259,27 @@ class MuldDownloadManager {
   };
 
   void DownloadDispatcherLoop();
-  void EnqueueTasks(DownloadEngine* job, int connections);
+  void ConnectionControlLoop();
+  void EnqueueTasks(DownloadEngine* job);
 
  private:
   LogCallback logger_;
+  int max_threads_ = 1;
   std::mutex jobs_mtx_;
   std::vector<std::shared_ptr<DownloadEngine>> jobs_;
   std::unordered_map<std::string, std::weak_ptr<DownloadEngine>> jobs_index_;
   std::unordered_set<std::string> loaded_images_;
   std::unique_ptr<ThreadPool> threadpool_;
+  std::unique_ptr<ConnectionController> connection_controller_;
   std::thread dispatcher_thread_;
+  std::thread controller_thread_;
   std::queue<PendingDownloadRequest> pending_requests_;
   std::mutex pending_mtx_;
   std::condition_variable pending_cv_;
+  std::mutex controller_mtx_;
+  std::condition_variable controller_cv_;
   bool stop_dispatcher_ = false;
+  bool stop_controller_ = false;
   std::vector<DownloadHandler> handler_;
 };
 

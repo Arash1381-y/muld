@@ -273,13 +273,25 @@ void DownloadWorkerImpl(const Task& task,
     bool is_connected = false;
 
     WorkItem* work_item;
-    while ((work_item = job->GetNextWorkItem()) != nullptr) {
+    while (true) {
+      if (job->ShouldReleaseConnection()) {
+        return;
+      }
+
+      work_item = job->GetNextWorkItem();
+      if (work_item == nullptr) {
+        break;
+      }
 
       std::size_t current_offset = work_item->range_start;
       bool chunk_finished = false;
 
       // Keep downloading until this chunk is perfectly finished
       while (!chunk_finished) {
+        if (job->ShouldReleaseConnection()) {
+          return;
+        }
+
         if (job->GetState() != DownloadState::Downloading) {
           return;
         }

@@ -190,7 +190,7 @@ int main(int argc, char* argv[]) {
   }
 
   MuldConfig config = {connections, cli_logger};
-  const MuldRequest request = {url.c_str(), output_path.c_str(), connections};
+  const MuldRequest request = {url.c_str(), output_path.c_str()};
   MuldDownloadManager manager(config);
 
   std::cout << "Starting download...\n";
@@ -309,5 +309,4 @@ int main(int argc, char* argv[]) {
 
   return 0;
 }
-
 

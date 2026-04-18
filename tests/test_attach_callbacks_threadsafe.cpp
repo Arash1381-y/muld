@@ -35,7 +35,7 @@ int main() {
   std::atomic<bool> keep_switching{true};
 
   MuldConfig config = {8, test_logger};
-  MuldRequest request = {kTestUrl, kOutputFile, 8};
+  MuldRequest request = {kTestUrl, kOutputFile};
   MuldDownloadManager manager(config);
 
   DownloadCallbacks callback_set_a;

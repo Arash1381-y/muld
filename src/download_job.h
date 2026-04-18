@@ -1,10 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,9 +29,10 @@ struct WorkItem {
 class DownloadEngine {
  public:
   DownloadEngine(const Url& url, const std::string& output_path,
-              int max_connections, size_t file_size, bool ranged,
-              size_t n_chunks, std::function<void(DownloadEngine*)> start_download,
-              const DownloadCallbacks& callbacks = {});
+                 int max_connections, size_t file_size, bool ranged,
+                 size_t n_chunks,
+                 std::function<void(DownloadEngine*)> start_download,
+                 const DownloadCallbacks& callbacks = {});
 
   DownloadEngine(const JobImage& image,
               std::function<void(DownloadEngine*)> start_download,
@@ -72,6 +73,7 @@ class DownloadEngine {
   void SetSpeedLimit(size_t speed_limit_bps);
   size_t GetSpeedLimit() const;
   size_t AcquireReadBudget(size_t requested_bytes);
+  double ConsumeTokenWaitRatio(std::chrono::milliseconds window);
 
   size_t GetNumChunks() const;
   DownloadState GetState() const;
@@ -86,8 +88,15 @@ class DownloadEngine {
   bool IsRanged() const;
   std::string GetIdentityKey() const;
 
- public:
-  int maxConnections_;  // active connections (threads)
+  void SetConnectionBounds(int min_connections, int max_connections);
+  int GetMinConnections() const;
+  int GetMaxConnections() const;
+  void SetDesiredConnections(int desired_connections);
+  int GetDesiredConnections() const;
+  int GetActiveConnections() const;
+  int GetScheduledConnections() const;
+  int PlanNewWorkers(int max_new_workers);
+  bool ShouldReleaseConnection();
 
  private:
   bool SetState(DownloadState state);
@@ -132,8 +141,14 @@ class DownloadEngine {
                                                  // for calculating speed
   std::atomic<double> downloadSpeed_;            // (bytes / per sec)
   std::atomic<double> eta_;                      // download job eta
+  double etaSmoothedSpeedBps_ = 0.0;
 
   std::atomic<int> nConnections_;  // active connections (threads)
+  std::atomic<int> scheduledConnections_{0};
+  std::atomic<int> minConnections_{1};
+  std::atomic<int> maxConnections_{1};
+  std::atomic<int> desiredConnections_{1};
+  std::atomic<int> releaseBudget_{0};
   std::mutex wait_mtx_, error_mtx_, disk_mtx_, speed_mtx_, callbacks_mtx_;
   std::condition_variable wait_cv_;
 
@@ -141,6 +156,8 @@ class DownloadEngine {
   double rateTokens_ = 0.0;
   std::chrono::steady_clock::time_point rateLastRefill_{
       std::chrono::steady_clock::now()};
+  std::atomic<std::uint64_t> rateWaitNsWindow_{0};
+  std::atomic<std::uint64_t> rateAcquireSamplesWindow_{0};
   mutable std::mutex rate_mtx_;
   std::condition_variable rate_cv_;
 

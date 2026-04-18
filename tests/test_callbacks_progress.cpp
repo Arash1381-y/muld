@@ -51,7 +51,7 @@ int main() {
   std::unordered_set<std::size_t> seen_chunk_ids;
 
   MuldConfig config = {8, test_logger};
-  MuldRequest request = {kTestUrl, kOutputFile, 8};
+  MuldRequest request = {kTestUrl, kOutputFile};
   MuldDownloadManager manager(config);
 
   auto [err, handler] = manager.Download(request, DownloadCallbacks{

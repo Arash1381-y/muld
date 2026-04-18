@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -28,8 +30,7 @@ DownloadEngine::DownloadEngine(
     size_t file_size, bool ranged, size_t n_chunks,
     std::function<void(DownloadEngine*)> start_download,
     const DownloadCallbacks& callbacks)
-    : maxConnections_(max_connections),
-      ranged_(ranged),
+    : ranged_(ranged),
       url_(url),
       outputPath_(output_path),
       fileSize_(file_size),
@@ -49,7 +50,11 @@ DownloadEngine::DownloadEngine(
   state_ = DownloadState::Initialized;
   createdAt_ = GetUnixTimestamp();
   updatedAt_ = createdAt_;
-  maxConnections_ = ranged_ ? maxConnections_ : 1;
+  const int effective_max = ranged_ ? std::max(1, max_connections) : 1;
+  minConnections_.store(1, std::memory_order_relaxed);
+  maxConnections_.store(effective_max, std::memory_order_relaxed);
+  desiredConnections_.store(
+      std::min(2, effective_max), std::memory_order_relaxed);
   writer_ = std::make_unique<Writer>(outputPath_, fileSize_);
   chunksInfo_.resize(nChunks_);
 
@@ -84,7 +89,12 @@ DownloadEngine::DownloadEngine(
   outputPath_ = image.file_path;
   fileSize_ = image.file_size;
   ranged_ = image.ranged;
-  maxConnections_ = ranged_ ? image.max_connections : 1;
+  const int effective_max =
+      ranged_ ? std::max(1, image.max_connections) : 1;
+  minConnections_.store(1, std::memory_order_relaxed);
+  maxConnections_.store(effective_max, std::memory_order_relaxed);
+  desiredConnections_.store(
+      std::min(2, effective_max), std::memory_order_relaxed);
   etag_ = image.etag;
   lastModified_ = image.last_modified;
   createdAt_ = image.created_at;
@@ -144,6 +154,11 @@ void DownloadEngine::NotifyConnectionOpen() {
 }
 
 void DownloadEngine::NotifyConnectionClose() {
+  int scheduled_remaining =
+      scheduledConnections_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (scheduled_remaining < 0) {
+    scheduledConnections_.store(0, std::memory_order_release);
+  }
   int remaining = nConnections_.fetch_sub(1) - 1;
   if (remaining == 0 && state_.load() == DownloadState::Canceled) {
     CleanupArtifacts(true);
@@ -161,6 +176,94 @@ bool DownloadEngine::IsRanged() const { return ranged_; }
 
 std::string DownloadEngine::GetIdentityKey() const {
   return outputPath_ + "\n" + GetUrlString(url_);
+}
+
+void DownloadEngine::SetConnectionBounds(int min_connections,
+                                         int max_connections) {
+  if (!ranged_) {
+    min_connections = 1;
+    max_connections = 1;
+  }
+
+  min_connections = std::max(1, min_connections);
+  max_connections = std::max(min_connections, max_connections);
+
+  minConnections_.store(min_connections, std::memory_order_relaxed);
+  maxConnections_.store(max_connections, std::memory_order_relaxed);
+  SetDesiredConnections(desiredConnections_.load(std::memory_order_relaxed));
+}
+
+int DownloadEngine::GetMinConnections() const {
+  return minConnections_.load(std::memory_order_relaxed);
+}
+
+int DownloadEngine::GetMaxConnections() const {
+  return maxConnections_.load(std::memory_order_relaxed);
+}
+
+void DownloadEngine::SetDesiredConnections(int desired_connections) {
+  const int min_connections = GetMinConnections();
+  const int max_connections = GetMaxConnections();
+  const int clamped =
+      std::clamp(desired_connections, min_connections, max_connections);
+  const int previous =
+      desiredConnections_.exchange(clamped, std::memory_order_acq_rel);
+  if (clamped < previous) {
+    releaseBudget_.fetch_add(previous - clamped, std::memory_order_release);
+  }
+}
+
+int DownloadEngine::GetDesiredConnections() const {
+  return desiredConnections_.load(std::memory_order_relaxed);
+}
+
+int DownloadEngine::GetActiveConnections() const {
+  return nConnections_.load(std::memory_order_relaxed);
+}
+
+int DownloadEngine::GetScheduledConnections() const {
+  return scheduledConnections_.load(std::memory_order_relaxed);
+}
+
+int DownloadEngine::PlanNewWorkers(int max_new_workers) {
+  if (max_new_workers <= 0) {
+    return 0;
+  }
+  const auto state = GetState();
+  if (state != DownloadState::Queued && state != DownloadState::Downloading) {
+    return 0;
+  }
+
+  while (true) {
+    int scheduled = scheduledConnections_.load(std::memory_order_acquire);
+    const int desired = GetDesiredConnections();
+    if (scheduled >= desired) {
+      return 0;
+    }
+
+    const int to_add = std::min(desired - scheduled, max_new_workers);
+    if (to_add <= 0) {
+      return 0;
+    }
+
+    if (scheduledConnections_.compare_exchange_weak(
+            scheduled, scheduled + to_add, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return to_add;
+    }
+  }
+}
+
+bool DownloadEngine::ShouldReleaseConnection() {
+  int budget = releaseBudget_.load(std::memory_order_acquire);
+  while (budget > 0) {
+    if (releaseBudget_.compare_exchange_weak(
+            budget, budget - 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 WorkItem* DownloadEngine::GetNextWorkItem() {
@@ -242,6 +345,7 @@ size_t DownloadEngine::AcquireReadBudget(size_t requested_bytes) {
     return requested_bytes;
   }
 
+  std::uint64_t total_wait_ns = 0;
   std::unique_lock<std::mutex> lock(rate_mtx_);
   while (true) {
     auto now = std::chrono::steady_clock::now();
@@ -254,10 +358,18 @@ size_t DownloadEngine::AcquireReadBudget(size_t requested_bytes) {
         allowed = 1;
       }
       rateTokens_ -= static_cast<double>(allowed);
+      rateAcquireSamplesWindow_.fetch_add(1, std::memory_order_relaxed);
+      if (total_wait_ns > 0) {
+        rateWaitNsWindow_.fetch_add(total_wait_ns, std::memory_order_relaxed);
+      }
       return allowed;
     }
 
     if (GetState() != DownloadState::Downloading) {
+      rateAcquireSamplesWindow_.fetch_add(1, std::memory_order_relaxed);
+      if (total_wait_ns > 0) {
+        rateWaitNsWindow_.fetch_add(total_wait_ns, std::memory_order_relaxed);
+      }
       return 0;
     }
 
@@ -268,8 +380,41 @@ size_t DownloadEngine::AcquireReadBudget(size_t requested_bytes) {
     auto wake_time =
         now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                   std::chrono::duration<double>(seconds_to_one));
+    const auto wait_begin = std::chrono::steady_clock::now();
     rate_cv_.wait_until(lock, wake_time);
+    const auto wait_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_begin)
+            .count();
+    if (wait_ns > 0) {
+      total_wait_ns += static_cast<std::uint64_t>(wait_ns);
+    }
   }
+}
+
+double DownloadEngine::ConsumeTokenWaitRatio(std::chrono::milliseconds window) {
+  if (window.count() <= 0) {
+    return 0.0;
+  }
+
+  const std::uint64_t waited_ns =
+      rateWaitNsWindow_.exchange(0, std::memory_order_acq_rel);
+  const std::uint64_t samples =
+      rateAcquireSamplesWindow_.exchange(0, std::memory_order_acq_rel);
+  if (samples == 0) {
+    return 0.0;
+  }
+
+  const long double window_ns =
+      static_cast<long double>(window.count()) * 1000000.0L;
+  const long double denom = static_cast<long double>(samples) * window_ns;
+  if (denom <= 0.0L) {
+    return 0.0;
+  }
+
+  long double ratio = static_cast<long double>(waited_ns) / denom;
+  ratio = std::clamp(ratio, 0.0L, 1.0L);
+  return static_cast<double>(ratio);
 }
 
 void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
@@ -289,10 +434,33 @@ void DownloadEngine::NotifyChunkReceived(size_t chunk_id, size_t bytes) {
     dt = std::chrono::duration<double>(now - lastSpeedCalcTime_).count();
     if (dt > 0.5) {
       // compute speed and eta
-      downloadSpeed_.store(nBytesFromLastSpeedCalc_ / dt);
-      double speed = downloadSpeed_.load();
-      if (speed > 0) {
-        eta_.store((fileSize_ - nTotalReceivedBytes_) / speed);
+      const double instant_speed =
+          static_cast<double>(nBytesFromLastSpeedCalc_.load()) / dt;
+      downloadSpeed_.store(instant_speed);
+
+      constexpr double kEtaSpeedAlpha = 0.25;
+      constexpr double kEtaAlpha = 0.30;
+      if (etaSmoothedSpeedBps_ <= 0.0) {
+        etaSmoothedSpeedBps_ = instant_speed;
+      } else {
+        etaSmoothedSpeedBps_ =
+            (1.0 - kEtaSpeedAlpha) * etaSmoothedSpeedBps_ +
+            kEtaSpeedAlpha * instant_speed;
+      }
+
+      const size_t received = nTotalReceivedBytes_.load();
+      const size_t remaining = (received < fileSize_) ? (fileSize_ - received) : 0;
+      if (remaining == 0) {
+        eta_.store(0.0);
+      } else if (etaSmoothedSpeedBps_ > 1.0) {
+        const double instant_eta =
+            static_cast<double>(remaining) / etaSmoothedSpeedBps_;
+        const double current_eta = eta_.load();
+        if (current_eta <= 0.0) {
+          eta_.store(instant_eta);
+        } else {
+          eta_.store((1.0 - kEtaAlpha) * current_eta + kEtaAlpha * instant_eta);
+        }
       }
 
       // reset states
@@ -424,10 +592,11 @@ void DownloadEngine::BuildPendingWork() {
 bool DownloadEngine::Start() {
   if (!SetState(DownloadState::Queued)) return false;
 
-  // Wait for any dangling connections to close
-  while (nConnections_.load() != 0) {
+  // Wait for previous worker generation to fully drain.
+  while (scheduledConnections_.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
+  releaseBudget_.store(0, std::memory_order_release);
 
   BuildPendingWork();
 
@@ -437,6 +606,7 @@ bool DownloadEngine::Start() {
   nBytesFromLastSpeedCalc_ = 0;
   downloadSpeed_ = 0;
   eta_ = 0;
+  etaSmoothedSpeedBps_ = 0.0;
 
   start_download_(this);
 
@@ -446,10 +616,11 @@ bool DownloadEngine::Start() {
 bool DownloadEngine::Resume() {
   if (!SetState(DownloadState::Queued)) return false;
 
-  // Wait for any dangling connections to close
-  while (nConnections_.load() != 0) {
+  // Wait for previous worker generation to fully drain.
+  while (scheduledConnections_.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
+  releaseBudget_.store(0, std::memory_order_release);
 
   BuildPendingWork();
 
@@ -459,6 +630,7 @@ bool DownloadEngine::Resume() {
   nBytesFromLastSpeedCalc_ = 0;
   downloadSpeed_ = 0;
   eta_ = 0;
+  etaSmoothedSpeedBps_ = 0.0;
 
   start_download_(this);
 
@@ -631,7 +803,7 @@ void DownloadEngine::StoreUnlocked() {
 
   JobImage img = {.file_path = writer_->filePath_,
                   .file_size = fileSize_,
-                  .max_connections = maxConnections_,
+                  .max_connections = maxConnections_.load(),
                   .ranged = ranged_,
                   .url = GetUrlString(url_),
                   .etag = etag_,
