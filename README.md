@@ -35,7 +35,7 @@ If you want a desktop frontend, see **muld-gui**:
 
 > Note: Windows portability is actively improving. Core build support is present; always validate with latest dependencies/toolchain.
 
-## Install (quick)
+## Install
 
 ### 1) Install dependencies
 
