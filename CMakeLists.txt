@@ -57,6 +57,9 @@ target_link_libraries(muld
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(muld PRIVATE -Wall -Wextra -pedantic)
     target_compile_options(muld PRIVATE $<$<CONFIG:Debug>:-O0 -g> $<$<CONFIG:Release>:-O3>)
+elseif(MSVC)
+    target_compile_options(muld PRIVATE /W4 /permissive-)
+    target_compile_options(muld PRIVATE $<$<CONFIG:Release>:/O2>)
 endif()
 
 # --- CLI Application ---
