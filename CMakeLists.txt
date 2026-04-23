@@ -28,15 +28,11 @@ find_package(OpenSSL REQUIRED)
 add_library(muld STATIC
     src/chunk_info.h
     src/connection_controller.h
-    src/download_handler.h
-    src/download_job.h
+    src/download_engine.h
     src/connection_controller.cpp
-    src/download_job.cpp
+    src/download_engine.cpp
     src/downloader.h
-    src/error.h
     src/file_info.h
-    src/logger.h
-    src/muld_download_manager.h
     src/task.h
     src/threadpool.h
     src/url.h

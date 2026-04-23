@@ -1,5 +1,4 @@
-
-#include "muld_download_manager.h"
+#include <muld/muld.h>
 
 #include <algorithm>
 #include <chrono>
@@ -12,10 +11,11 @@
 #include <unordered_map>
 
 #include "connection_controller.h"
-#include "downloader.h"
 #include "task.h"
 #include "threadpool.h"
 #include "url.h"
+#include "file_info.h"
+#include "downloader.h"
 
 constexpr int MAX_REDIRECT_ALLOW = 3;
 constexpr size_t MIN_CHUNK_SIZE = 1 * 1024 * 1024;   // 1 MB

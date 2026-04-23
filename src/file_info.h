@@ -1,10 +1,11 @@
 #pragma once
 
+#include <muld/muld.h>
+
 #include <cstddef>
 #include <string>
 #include <variant>
 
-#include "error.h"
 
 namespace muld {
 

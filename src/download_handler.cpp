@@ -1,9 +1,9 @@
-#include "download_handler.h"
+#include <muld/muld.h>
 
 #include <functional>
 #include <mutex>
 
-#include "download_job.h"
+#include "download_engine.h"
 #include "url.h"
 
 namespace muld {

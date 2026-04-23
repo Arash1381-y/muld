@@ -1,7 +1,7 @@
 #pragma once
 
-#include "logger.h"
-#include "download_job.h"
+#include <muld/muld.h>
+#include "download_engine.h"
 
 namespace muld {
 
